@@ -1,7 +1,7 @@
-# dsh-tui-secret —— 一行插件。config 里的每个键都有默认值（见 lib/types/index.js）。
+# dsh-tui-secret — a one-row plugin. Every key in `config` has a default (see lib/types/index.js).
 #
-# 位置：装进 dsh-tui profile 后由 profile 组合加载；插件行在首帧之后激活，
-# 所以 apply 里不 await、也不用 ctx.root 的能力。
+# The row is loaded by the dsh-tui profile composition. It activates after the first frame,
+# so `apply` must not await and must not use ctx.root capabilities.
 - insert:
     - id: dsh-tui-secret
       name: dsh-tui-secret
