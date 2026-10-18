@@ -1,0 +1,65 @@
+{
+  "name": "dsh-tui-secret",
+  "version": "0.1.0",
+  "description": "Secure secret entry for dsh-TUI: a /secrets scene that writes through the dsh credentials seam",
+  "type": "module",
+  "main": "lib/types/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/types/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "docs",
+    "scripts",
+    "cordis.patch.yml",
+    "dsh-plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node scripts/verify.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-tui",
+    "tui",
+    "secrets",
+    "credentials",
+    "masked-input"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zerodegress/dsh-tui-secret.git"
+  },
+  "homepage": "https://github.com/zerodegress/dsh-tui-secret#readme",
+  "bugs": {
+    "url": "https://github.com/zerodegress/dsh-tui-secret/issues"
+  },
+  "bin": {
+    "dsh-tui-secret": "bin/dsh-tui-secret.mjs"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
+  "id": "com.zerodegress.dsh-tui-secret",
+  "name": "dsh-tui-secret",
+  "version": "0.1.0",
+  "manifestVersion": "0.15",
+  "x-description": "Secure secret entry for DeepSeek Harness TUI. A /secrets scene renders its own masked input (one bullet per keystroke, never the value or its length) and writes through the dsh credentials seam; it never registers a shell-env contributor, never logs a value, and never writes the credential document itself.",
+  "facets": {
+    "host": {
+      "entry": "lib/types/index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "requires": {
+    "contracts": [
+      {
+        "apiVersion": "commands.dsh/v1alpha1",
+        "kind": "Command"
+      },
+      {
+        "apiVersion": "tui.dsh/v1alpha1",
+        "kind": "Scene",
+        "optional": true,
+        "fallback": "without the tuiScenes seam the plugin registers nothing and the TUI keeps running (no scene, no command)"
+      }
+    ]
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "dsh-tui-secret.open",
+        "title": "Open the secret manager (masked entry, list, delete)"
+      }
+    ],
+    "x-dsh-tui": [
+      {
+        "apiVersion": "tui.dsh/v1alpha1",
+        "kind": "Scene",
+        "id": "secrets",
+        "spec": {
+          "title": "Secrets"
+        }
+      }
+    ]
+  },
+  "permissions": [
+    {
+      "name": "commands.invoke",
+      "scope": "dsh-tui-secret.open",
+      "reason": "open the /secrets scene from the composed command surface"
+    }
+  ],
+  "subscriptions": [],
+  "license": "MIT"
+}
