@@ -3,6 +3,9 @@
 //      rendered frame, no log line, no outbound call and no model-facing surface ever holds it.
 //   2. CLI-side write checks: the command shares the provider's lock, performs a row-level
 //      upsert only, and is fail-closed wherever a premise is missing.
+//   3. A declaration gate: dsh-plugin.json is run through the host's own @dsh-std/manifest
+//      parser and the TUI profile validator, so a drifted manifest fails here, not at
+//      admission.
 //
 // How the scene half works: a minimal React hook runtime and a ui kit stand-in drive the real
 // scene in real key order (`a` → name → Enter → value → Enter), recording every rendered frame,
@@ -639,6 +642,42 @@ await check('⑲ cli set --dry-run: no write, no lock', async () => {
   assert(!result.stdout.includes(CLI_SECRET), 'dry-run printed the value')
   assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'dry-run wrote to disk')
   assert(!fs.existsSync(`${file}.lock`), 'dry-run created a lock')
+})
+
+// ---------------------------------------------------------------- the declaration gate
+// The plugin declaration is consumed twice: the community parser validates its structure
+// (and the host derives the plugin identity from projection.metadata.name), while the TUI
+// profile adds semantic rules on top of it. Both are checked here against the host install,
+// offline, so a drifted manifest fails locally instead of at admission.
+await check('⑳ the declaration passes the upstream parser and the TUI profile gate', async () => {
+  const hostDir = path.join(os.homedir(), '.dsh/profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui')
+  const parserEntry = path.join(hostDir, 'node_modules/@dsh-std/manifest/lib/index.js')
+  if (!fs.existsSync(parserEntry)) {
+    throw new Skip(`no dsh-TUI host install at ${hostDir}, skipping the declaration gate`)
+  }
+  const { pathToFileURL } = await import('node:url')
+  const parser = await import(pathToFileURL(parserEntry).href)
+  const source = fs.readFileSync(new URL('../dsh-plugin.json', import.meta.url), 'utf8')
+
+  let manifest
+  try {
+    const parsed = parser.parseManifest(source)
+    manifest = parsed.manifest ?? parsed
+  } catch (error) {
+    throw new Error(`parseManifest rejected dsh-plugin.json: ${error?.message ?? error}`)
+  }
+  const projection = parser.projectManifest(manifest)
+  // The host keys the plugin identity on this value (componentId), so it has to be the id.
+  assert(projection.metadata.name === manifest.id, `projection.metadata.name ${projection.metadata.name} is not the manifest id ${manifest.id}`)
+  assert(typeof manifest.description === 'undefined', 'description is not a community v0.15 field; use x-description')
+  assert(Array.isArray(manifest.subscriptions), 'subscriptions is required by the schema')
+
+  const data = (await import(pathToFileURL(path.join(hostDir, 'lib/types/adapter/standard/registry.js')).href)).loadSpecData()
+  if (data === undefined) throw new Skip('the host ships no TUI profile spec data, skipping the profile gate')
+  const { createContractIndex, validatePlugin } = await import(pathToFileURL(path.join(hostDir, 'lib/types/adapter/standard/validate.js')).href)
+  const index = createContractIndex(data.registry, data.permissions)
+  assert(index.facetApiVersions.includes(manifest.facets.host.apiVersion), `facet apiVersion is not admitted: ${manifest.facets.host.apiVersion}`)
+  validatePlugin(index, manifest)
 })
 
 // ---------------------------------------------------------------- summary
