@@ -70,13 +70,23 @@ export interface UseResult {
   exitCode: number
   stdout: string
   stderr: string
+  /**
+   * True when the value was found in the returned slice and replaced. False is **not** proof
+   * that the output never held it: the executor's capture can be truncated, and a cut can land
+   * in the middle of the value (or the command can transform it). What we guarantee is the
+   * wording: this slice as returned carries no occurrence we could see.
+   */
   redacted: boolean
+  /** The executor's first cause: a timeout on our deadline. */
+  timedOut: boolean
+  /** The executor's first cause: the caller's signal fired. */
+  aborted: boolean
   injectedAs: string
 }
 
 /**
- * Run `argv` with `value` in the child environment only. Returns the redacted output; the
- * caller records the audit trail (this function writes nothing).
+ * Run `argv` with `value` in the child environment only. Returns the (best-effort) redacted
+ * output; the caller records the audit trail (this function writes nothing).
  */
 export async function runWithCredential(
   shell: ShellSeam,
@@ -95,16 +105,14 @@ export async function runWithCredential(
 
   const stdout = redact(textOf(result.stdout), input.value)
   const stderr = redact(textOf(result.stderr), input.value)
-  const notes: string[] = []
-  if (result.timedOut) notes.push(`timed out after ${input.timeoutMs}ms`)
-  if (result.aborted) notes.push('aborted')
-  const suffix = notes.length > 0 ? `\n(${notes.join('; ')})` : ''
 
   return {
     exitCode: result.exitCode ?? -1,
-    stdout: stdout.text + suffix,
+    stdout: stdout.text,
     stderr: stderr.text,
     redacted: stdout.hit || stderr.hit,
+    timedOut: Boolean(result.timedOut),
+    aborted: Boolean(result.aborted),
     injectedAs,
   }
 }

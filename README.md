@@ -15,21 +15,24 @@
 > Values only ever reach DSH's own credential seam; the plugin never echoes one, never
 > logs one, and never puts one into the conversation.
 >
-> The same code also ships a `dsh-tui-secret` CLI for scripts and non-TTY use. It does not
-> bypass DSH storage: it shares the credential provider's writer lock and atomic-write
-> protocol.
+> The agent can ask for one: `request_credential` puts a masked card in front of you and the
+> value goes straight into the DSH credential store — the tool only gets a status back.
+> `use_credential` then runs one command with that value in **its own child process**, and the
+> returned output has every occurrence of the value replaced with `[credential]`.
 
 ## Highlights
 - **Masked entry inside the scene** — `/secrets` opens a full-screen scene: `a` starts a
   reference, the value is typed with per-keystroke masking, `Enter` writes it.
 - **A fixed-length mask** — `••••` whatever the length: the screen shows neither the
   characters nor how many there are.
-- **One value path only** — a value reaches `ctx.credentials` and nothing else; no tool, no
-  `tools/execute`, no `llm/stream`, no shell-env contributor.
-- **List and delete, values never shown** — the list reports configured state, source and
-  writability from `credentials.describe()`; deletion needs an explicit `y`.
-- **A CLI for scripts and non-TTY use** — `list` / `set` / `rm`, sharing the credential
-  provider's own writer lock and atomic write, fail-closed without an explicit value source.
+- **The agent asks, you decide** — `request_credential(ref, purpose)` shows a card with the
+  name, the purpose and four choices: not allowed / once / this session / until a time.
+- **Stored, never handed over** — the value reaches `ctx.credentials` and nothing else; the
+  tool's result carries a status, and the value never enters the conversation.
+- **Use without handing it over** — `use_credential(ref, argv)` runs one command with the
+  value in that child process only and replaces it with `[credential]` in the returned output.
+- **List, delete and revoke, values never shown** — the list reports configured state plus the
+  agent permission: `d` deletes (explicit `y`), `v` revokes one permission, `R` revokes all.
 - **The declaration is gated** — `npm test` runs `dsh-plugin.json` through the host's own
   parser and the TUI profile validator, so a drifted manifest fails locally.
 
@@ -55,53 +58,36 @@ Or add one row to the profile's `cordis.patch.yml` (this package's own
 
 Restart the TUI and type `/secrets`.
 
-### CLI
-```sh
-dsh-tui-secret list [--json]                 # names and state only, never values
-dsh-tui-secret set NAME --from-stdin         # read the value from stdin
-dsh-tui-secret set NAME --from-file ./k.txt  # read the value from a file
-dsh-tui-secret set NAME                      # on a TTY: one no-echo prompt
-dsh-tui-secret rm NAME --yes                 # delete (refused without --yes)
-```
+### Agent tools
+Two tools are registered at runtime (the host has no manifest contract for tools):
 
-A value never enters argv. Input is taken verbatim, with no trimming (`echo` appends a
-newline — use `printf '%s'`); the command reports the byte count so it can be checked.
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `request_credential` | `ref`, `purpose` | `stored` / `cancelled` / `refused` |
+| `use_credential` | `ref`, `argv[]`, `timeoutMs?` | `exitCode`, `stdout`, `stderr`, `redacted`, `timedOut`, `aborted`, `injectedAs` |
 
-How it coexists with the scene:
+`use_credential` runs exactly one command. The value goes into that child process's
+environment under the name reported back as `injectedAs`; it never enters the shell you or the
+agent sit in, and the executor's sandbox policy still applies. `argv` reaches the plugin as an
+array and each element is quoted by the plugin, so the model cannot feed the shell raw text: to
+use a pipe or a variable, it writes `["sh","-c","…"]` itself and that inner shell expands it.
 
-- **Same lock**: exclusive `wx` create of `<credentials file>.lock`, giving up after two
-  seconds with an error rather than guessing whether a holder still exists. It is the
-  provider's own lock (derived from the same path).
-- **Same atomic write**: random-suffix sibling in the same directory plus `rename`,
-  mode 0600, directory 0700.
-- **Re-read inside the lock**: the file is read again once the lock is held, so a commit
-  by another writer is never overwritten.
-- **Row-level upsert**: only the rows belonging to the target key are rewritten — other
-  keys, comments, key order and block scalars (the provider writes `KEY: |` for values
-  containing newlines) are left alone.
-- **Fail-closed**: no `--from-stdin`/`--from-file` on a non-TTY, an empty value, an
-  invalid name, a `DEEPSEEK_`/`DSH_` prefix, a name shadowed by the current environment
-  (the write would be masked into an apparent success), or a credentials file wider than
-  0600 — all exit with code 2 and write nothing. A file containing nested mappings or
-  duplicate keys is likewise refused.
-- Exit codes: `0` success, `1` runtime failure, `2` refusal or usage error.
-
-The provider watches the file by default (`watch: true`) and reloads on external changes;
-a deployment that turns the watcher off sees a new value on its next read.
-
-`list` reads the keys of the credential document directly (the source of truth for
-"what is stored") and merges in names recorded by the scene but not present there. The
-scene lists its own name index and never reads the credential document — the provider
-need not be file-backed, and the plugin should not assume where it lives.
+The value is entered by **you**, on the card. Neither tool accepts a value from the model, and
+neither tool ever returns one.
 
 ## Keybindings
 | Key | Action |
 | --- | --- |
 | `a` | New reference: name first, then value |
 | `d` | Delete the selected reference (`y` confirms) |
+| `v` | Revoke the agent permission on the selected reference |
+| `R` | Revoke every agent permission (`y` confirms; the stored values stay) |
 | `↑` `↓` | Move the selection |
 | `Enter` | Next step / write |
 | `Esc` | Back one step; on the list, `Esc` (or `q`) closes the scene |
+
+On a card the agent asked for: `1`–`4` (or `↑`/`↓`) pick the permission, `Enter` moves on,
+`r` refuses, `Esc` cancels.
 
 Names follow DSH rules: start with an uppercase letter, `A-Z 0-9 _` only, at most 64
 characters. `DEEPSEEK_` / `DSH_` prefixes belong to the host — the plugin refuses them on
@@ -116,11 +102,12 @@ silently drop the ref later.
   write, so a failure leaves nothing behind in state.
 - **The mask is a fixed-length placeholder (`••••`)**: it neither echoes characters nor
   reveals the length — a per-character dot mask already leaks information.
-- **No shellEnv contributor is registered**: `$NAME` never appears in the environment the
-  model can execute in, and it never competes with the `DSH_SECRET_*` key space of another
-  plugin.
-- **No tools, no `ctx.on('tools/execute' | 'llm/stream')`**: the model side has no exit, so
-  a value cannot reach tool-result, tool-card or llm-stream.
+- **No shellEnv contributor is registered**: `$NAME` never enters the environment the model
+  executes in. The only environment that ever holds the value is the one child process
+  `use_credential` spawns.
+- **The two tools are the whole model-facing surface** (nothing else is registered on
+  `tools/execute` or `llm/stream`): `request_credential` answers with a status, `use_credential`
+  with exit code and redacted output.
 - **Logs and errors carry the name and an error `code` only**: raw error text may embed
   the value, so it is never printed or persisted.
 - **The list shows configured state, source and writability only**, straight from
@@ -151,15 +138,22 @@ permissions are denied by default and require an entry in
 the plugin-private directory above.
 
 ## Known Limitations
-- **The CLI is not a second store**: it writes the provider's file and takes the
-  provider's lock. It lacks the provider's semantic completeness — the provider refuses a
-  write shadowed by *its own* launch environment, while the CLI can only judge by its own
-  process environment, so the verdicts can differ when a session starts from another
-  shell.
-- **No shell injection**: v1 only writes the credential store, for plugins that consume
-  credentials by ref (LLM keys and the like). Making `$NAME` visible in the model's shell
-  requires an additional shellEnv contributor and a prefix that cannot collide with
-  another plugin's.
+- **The credential store is plain text**: DSH stores values in
+  `<DSH_HOME>/.credentials.yaml` (no encryption), mode 0600 — that only keeps other local
+  users out, and the sandbox limits writes, not reads. An agent with `bash` can therefore
+  `cat` it. Blocking that needs an OS-level read restriction or moving the value out of the
+  user's reach: host or operations work, not this plugin's.
+- **Redaction covers one execution's returned slice**: the value cannot appear in a tool
+  result we produce, but a command may write it to a file, a network request or a log and fetch
+  it back; a truncated or transformed copy is not recognised either. `redacted: false` means
+  "nothing was detected in what came back", not "the output never held it".
+- **The permission gate is ours, not the store's**: another plugin that calls
+  `credentials.resolve(ref)` with the same name reads the value directly — we do not pretend
+  otherwise. The guarantee is narrower and true: every path the **agent** takes goes through
+  these two tools.
+- **`session` permissions never expire on their own**: resuming a session creates a new agent
+  with the same session id, so nothing can tell "this session is gone for good". Revoke them
+  yourself (`v`, `R`), or delete the reference. Only `once` and `until` clear themselves.
 - **No system keyring** (keyring / DPAPI): storage follows DSH's own semantics.
 - **No upstream patch**: dsh-TUI already declares the `secret: { ref }` field for settings
   sections; once its settings screen renders a mask of its own, this scene can shrink to
@@ -172,20 +166,22 @@ npm test        # = npm run compile && node scripts/verify.mjs
 ```
 
 The source is TypeScript in `src/`; `tsc` compiles it into `lib/types/`, which is what the host
-and the CLI load and what the npm package ships. `lib/` is generated and is not in git.
+the host loads and what the npm package ships. `lib/` is generated and is not in git.
 
-The script covers both halves plus one gate: `①–⑫` the scene (sentinel checks), `⑬–⑲` the
-CLI (write protocol and fail-closed behaviour), and `⑳` the plugin declaration, run through
-the host's own `@dsh-std/manifest` parser and the TUI profile validator.
+The script covers three layers plus one gate: `①–⑫` the scene (sentinel checks, including a
+real ink render), `⑬–⑮` the quoting of the model's `argv` against a real `/bin/sh`, the tools
+and the permission table (`㉑–㉟`: registration, refusals, scopes, audit, revoke, degradation,
+the card round-trip), and `⑳` the plugin declaration through the host's own
+`@dsh-std/manifest` parser and the TUI profile validator.
 
 - **The scene half** builds a minimal React hook runtime and a ui kit stand-in, drives the
   scene with real key order (`a` → name → `Enter` → value → `Enter`), records every
   rendered frame, every log line and every outbound call, then greps for a sentinel value.
   Step `⑫` swaps in the host's own React 19 and ink and renders into a non-TTY stream,
   frame by frame — element symbols, hook dispatcher and render path are all real.
-- **The CLI half** runs the real entry point as a subprocess and cross-checks with the host
-  `yaml` package (parsing the file back to compare the value) and with the provider's real
-  `withFileLock` (holding the lock against the CLI).
+- **The tools** are driven through a fake host (the same way the scene is driven through a
+  fake React), and the quoting checks run the built command through a real `/bin/sh`: hostile
+  arguments must arrive as data, and only a script the model writes itself may expand.
 
 Toolchain: Node `^22.19 || >=24`, ESM, no runtime dependencies;
 `@deepseek-ai/cordis` is an optional peer. The three devDependencies are for the build and the

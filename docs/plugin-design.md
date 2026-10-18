@@ -76,26 +76,38 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 | 内容 | 位置 | 权限 |
 | --- | --- | --- |
 | 值 | `<DSH_HOME>/.credentials.yaml`（由 provider 管） | 0600 |
-| 引用名清单 | `$DSH_TUI_HOME/dsh-tui-secret/refs.json` | 0600 / 目录 0700，原子写，损坏不覆盖 |
+| 引用记录（名字 + 授权） | `$DSH_TUI_HOME/dsh-tui-secret/refs.json` | 0600 / 目录 0700，原子写，损坏不覆盖 |
+| 审计 | 同目录 `audit.jsonl` | 0600，追加写，只有名字/用途/时间/会话/exit code |
 
 名字清单是索引而非密钥库：只有名字，没有值。它落在插件私有目录、不读 `.credentials.yaml`，
 因为 provider 未必是文件实现，插件不应假定凭据存在哪里。
 
-命令行（`bin/dsh-tui-secret.mjs` → `src/cli.ts`）是无 TTY 场景的补充入口。它不是
-第二套存储：写的就是 provider 那个文件，并用同一把锁（`src/cli.ts` 的
-`withWriterLock`）与同一套原子写。三条硬前提：
+## 授权模型
 
-1. **同一把锁**：锁路径 = `<凭据文件>.lock`，`wx` 独占创建，等不到就报错退出；不猜锁
-   持有者是否还在。
-2. **锁内重读**：拿到锁后重新读文件再改，其他写入者刚提交的内容不会被覆盖。
-3. **行级 upsert**：只重写目标键占的那几行（`renderUpsert` / `renderDelete`）。
-   provider 对含换行的值会写成块标量（`KEY: |`），所以「一个键占的行」是从它的
-   `KEY:` 行起、到下一个顶层键之前，含缩进的续行。其他键、注释、键序原样保留；
-   出现嵌套映射或重复键时拒绝改写。
+**agent 侧只有两个 model-facing 工具**（运行期注册；宿主 registry 里没有 `tools.dsh` 协议组，
+manifest 里不能声明工具）：
 
-命令行缺的是 provider 的语义完整性：provider 按**自己启动时的环境**判断「被环境遮蔽
-的写入」并拒绝，而命令行只能按自己进程的环境判断，两者在会话从别的 shell 启动时可能
-不一致。
+1. `request_credential(ref, purpose)` —— agent 发起请求，人在 `/secrets` 的卡片上决定；工具只回
+   `stored / cancelled / refused`。值由人在卡片上输入、直接 `ctx.credentials.set(ref, value)` 落存储，
+   **不经过工具结果**。请求被拒或被取消时**一个字节都不写**。
+2. `use_credential(ref, argv)` —— 用该凭据跑**一条**命令：值放进 `ctx.shell` 那次执行的
+   `spec.env`（`DSH_SECRET_<REF>`，由返回值 `injectedAs` 告知模型），不进会话环境；返回
+   `{ exitCode, stdout, stderr, redacted, timedOut, aborted, injectedAs }`，输出里出现的值换成
+   `[credential]`。`argv` 是数组，**由插件对每个元素做 shell 引号后拼成命令串** —— 模型喂不进裸
+   shell 文本；要用管道或变量，它自己写 `["sh","-c","…"]`，由那层内层 shell 展开。
+
+**四个 scope 全部在 `use_credential` 入口判定**（因为「用」这件事只经过这个工具）：
+
+| scope | 判定 |
+| --- | --- |
+| `none` | 直接拒绝 |
+| `once` | `useCount === 0` 才放行，放行后立刻撤销 |
+| `session` | 记录里的 `SessionId` 等于本次 `exec.agent.id`；**恢复/继续同一个 session 后仍然有效，不自动清**（恢复会新建 agent，没有信号能判断会话不会回来），撤销靠人在场景里按 `v` / `R` |
+| `until` | `Date.now() < expiresAt` |
+
+**如实写明的边界**：闸门只对 agent 这条路（也就是这两个工具）有效；别的插件按同名
+`credentials.resolve()` 取值，我们拦不住，也不假装拦得住。凭据库是明文、沙箱只限写，
+有 `bash` 的 agent 可以直接读文件 —— 要挡住那条得靠 OS 级读限制（宿主/运维的活）。
 
 ## 消费面与脱敏
 
@@ -115,8 +127,14 @@ TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编�
   按真人按键顺序驱动，记录每一帧渲染字符串、每一条日志、每一次对外调用，再用哨兵值
   grep。其中 `⑫` 换成宿主自己的 React 19 与 ink，渲进非 TTY 流逐帧 grep——元素符号、
   hook dispatcher、渲染路径都是真的。
-- **命令行层**（`⑬–⑲`）：以子进程跑真实入口，并调用宿主 `yaml` 包把文件解析回来比对
-  值、用 provider 真正的 `withFileLock` 占锁对撞。
+- **引号与 shell 边界层**（`⑬–⑮`）：把插件拼出来的命令串真的交给 `/bin/sh` 跑 —— 恶意
+  `argv`（`;`、`$()`、反引号、引号、换行、空串）必须原样当数据到达；值只在模型**自己写的**
+  `["sh","-c","…"]` 里展开，且展开后的输出照样被换成 `[credential]`。
+- **工具与权限层**（`㉑–㉟`）：用假宿主驱动两个工具 —— 运行期注册、未授权即拒绝且不启动命令、
+  值只进那一次执行的 `spec.env`（父进程环境逐字节不变）、四个 scope 的入口判定、`once` 用后即撤、
+  `until` 到期、`session` 按 session id 且不自动清、审计无值、拒绝/取消零写入、v1 记录兼容、
+  `v` / `R` 撤销、没有 shell 面与没有 TUI 前台时的降级、卡片来回（选 scope → 掩码输入 → 落存储，
+  settle 里不含值）。
 
 它不覆盖真机 TTY 的回滚缓冲与终端录像，也覆盖不到终端之外的写入方（Web 卡片、`dsh`
 自己写同一份凭据文件）；这些需要真实终端手测。
@@ -135,4 +153,6 @@ TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编�
 - 只支持 `@deepseek-harness-tui/dsh-tui` 0.16.x；其他 TUI 实现不在目标内。
 - Node `^22.19 || >=24`；ESM；无运行时依赖；构建依赖只有 `typescript` / `@types/node` /
   `@deepseek-ai/cordis`（首次要联网 `pnpm install`，`lib/` 不入库）。
-- 接缝缺席时静默降级：场景面不在就什么都不注册，绝不拖垮 TUI 启动。
+- 接缝缺席时静默降级：场景面不在就什么都不注册，绝不拖垮 TUI 启动；工具面不在就两个工具都不注册。
+- **局限（如实写）**：凭据库是明文 YAML、沙箱只限写 → 有 `bash` 的 agent 能直接读；脱敏只覆盖
+  那一次执行的返回片段；闸门只对 agent 这条路有效（别的插件按同名 resolve 就能取值）。

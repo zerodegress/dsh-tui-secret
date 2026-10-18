@@ -541,6 +541,315 @@ await check('⑮ a script the model writes itself is expanded — and its output
   assert(!result.stdout.includes(value) && !result.stderr.includes(value), 'the value survived in the returned output')
 })
 
+// ---------------------------------------------------------------- the two tools
+// Registration, refusals, the scope table, the audit trail and the degradation paths are driven
+// through a fake host — the same way the scene checks are driven through a fake React.
+const { apply } = plugin
+
+/** A host with exactly the seams apply() looks for; each one can be switched off. */
+function toolHost(options = {}) {
+  const registered = { tools: [], scenes: [] }
+  const shellRuns = []
+  const warns = []
+  const value = options.value ?? 'TOOL_SENTINEL_5c31'
+  const credentials = options.credentials ?? {
+    async describe() { return { configured: true, source: 'file', writable: true } },
+    async resolve() { return { value, source: 'file' } },
+    async set() {},
+    async unset() {},
+  }
+  const ctx = {
+    logger: { info: () => {}, warn: (message) => warns.push(message) },
+    inject: (names, callback) => {
+      // Cordis hands the callback a scoped context where the injected services are properties.
+      const scoped = { ...ctx, ...Object.fromEntries(names.map((name) => [name, ctx.get(name, false)])) }
+      scoped.inject = ctx.inject
+      scoped.effect = ctx.effect
+      scoped.get = ctx.get
+      callback(scoped)
+    },
+    effect: () => {},
+    get(name) {
+      if (name === 'credentials') return options.noCredentials ? undefined : credentials
+      if (name === 'commands') return { register() { return () => {} } }
+      if (name === 'tuiScenes') {
+        return options.noScenes ? undefined : {
+          register(descriptor) { registered.scenes.push(descriptor); return () => {} },
+          open: () => options.openResult ?? true,
+        }
+      }
+      if (name === 'tools') {
+        return options.noTools ? undefined : { register(definition) { registered.tools.push(definition); return () => {} } }
+      }
+      if (name === 'shell') {
+        return options.noShell ? undefined : {
+          resolve(request) { return request },
+          async execute(spec) {
+            shellRuns.push(spec)
+            const outcome = options.run?.(spec) ?? { exitCode: 0, stdout: '', stderr: '', timedOut: false, aborted: false }
+            return { result: async () => outcome }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  return { ctx, registered, shellRuns, warns, credentials }
+}
+
+const toolNamed = (registered, toolName) => registered.tools.find((entry) => entry.name === toolName)
+/** A fresh DSH_TUI_HOME for one check; the store reads process.env on every call. */
+function freshTuiHome(label) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-tui-secret-${label}-`))
+  process.env.DSH_TUI_HOME = dir
+  return dir
+}
+const recordFile = (home) => path.join(home, 'dsh-tui-secret', 'refs.json')
+const auditFile = (home) => path.join(home, 'dsh-tui-secret', 'audit.jsonl')
+
+await check('㉑ both tools register at runtime and a missing tools seam is not fatal', async () => {
+  freshTuiHome('tools')
+  const host = toolHost()
+  apply(host.ctx)
+  const names = host.registered.tools.map((entry) => entry.name).sort()
+  assert(names.join(',') === 'request_credential,use_credential', `wrong tools: ${names.join(',')}`)
+  for (const entry of host.registered.tools) {
+    assert(typeof entry.execute === 'function', `${entry.name} has no execute`)
+    assert(entry.output && entry.output.schema && typeof entry.output.render === 'function', `${entry.name} has no output{schema,render}`)
+    assert(entry.parameters.type === 'object', `${entry.name} declares no object schema`)
+  }
+  const bare = toolHost({ noTools: true })
+  apply(bare.ctx)
+  assert(bare.registered.tools.length === 0, 'a tool was registered without a tools seam')
+  assert(bare.warns.some((line) => line.includes('no tools seam')), 'the missing tools seam was not warned about')
+})
+
+await check('㉒ no permission means refused, and the command never starts', async () => {
+  freshTuiHome('denied')
+  store.markStored('ALPHA_TOKEN', { scope: 'none' })
+  const host = toolHost()
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  const denied = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['echo', 'x'] }, { agent: { id: 'session-a' } })
+  assert(denied.status === 'refused', `scope none was not refused: ${JSON.stringify(denied)}`)
+  assert(host.shellRuns.length === 0, 'the shell ran although no permission was granted')
+  const unknown = await use.execute({ ref: 'NEVER_STORED', argv: ['echo', 'x'] }, {})
+  assert(unknown.status === 'refused', 'an unknown reference was not refused')
+  const badName = await use.execute({ ref: 'DSH_HOME', argv: ['echo', 'x'] }, {})
+  assert(badName.status === 'refused', 'a reserved name was not refused')
+  assert(host.shellRuns.length === 0, 'a refusal still started a command')
+})
+
+await check('㉓ the value goes into that one execution and nowhere else', async () => {
+  freshTuiHome('env')
+  const value = 'ENV_SENTINEL_7d2f'
+  store.markStored('ALPHA_TOKEN', { scope: 'once', sessionId: 'session-a' })
+  const before = JSON.stringify(process.env)
+  const host = toolHost({ value })
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  assert(use.parameters.properties.argv.type === 'array', 'argv is not declared as an array')
+  assert(!('env' in use.parameters.properties) && !('value' in use.parameters.properties), 'the tool exposes env/value to the model')
+  const result = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-a' } })
+  assert(result.exitCode === 0, `the call failed: ${JSON.stringify(result)}`)
+  assert(JSON.stringify(process.env) === before, 'the parent environment changed')
+  const spec = host.shellRuns[0]
+  assert(spec.env.DSH_SECRET_ALPHA_TOKEN === value, `wrong child env: ${JSON.stringify(spec.env)}`)
+  assert(Object.keys(spec.env).length === 1, `the child env carries more than the value: ${JSON.stringify(spec.env)}`)
+  assert(!('dshEnv' in spec), 'the managed DSH_* slot must not be used')
+  assert(spec.command === "'echo' 'hi'", `the command was not built from quoted argv: ${spec.command}`)
+})
+
+await check('㉔ the returned slice is redacted and the audit holds no value', async () => {
+  const home = freshTuiHome('redact')
+  const value = 'REDACT_SENTINEL_9a11'
+  store.markStored('ALPHA_TOKEN', { scope: 'until', expiresAt: new Date(Date.now() + 60_000).toISOString() })
+  const host = toolHost({ value, run: () => ({ exitCode: 0, stdout: `token=${value}\nsecond ${value}\n`, stderr: `err ${value}`, timedOut: false, aborted: false }) })
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  const result = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['sh', '-c', 'printf %s "$DSH_SECRET_ALPHA_TOKEN"'] }, {})
+  assert(result.stdout === 'token=[credential]\nsecond [credential]\n', `stdout was not redacted: ${JSON.stringify(result.stdout)}`)
+  assert(result.stderr === 'err [credential]', `stderr was not redacted: ${JSON.stringify(result.stderr)}`)
+  assert(result.redacted === true, 'the redaction flag was not set')
+  assert(!JSON.stringify(result).includes(value), 'the value came back in the tool result')
+  const audit = fs.readFileSync(auditFile(home), 'utf8')
+  assert(audit.includes('"event":"used"') && audit.includes('"event":"redacted"'), `the audit misses events: ${audit}`)
+  assert(!audit.includes(value), 'the audit holds the value')
+})
+
+await check('㉕ once is used up by one call; ㉖ until expires', async () => {
+  freshTuiHome('windows')
+  const host = toolHost()
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  store.markStored('ONCE_TOKEN', { scope: 'once', sessionId: 'session-a' })
+  const first = await use.execute({ ref: 'ONCE_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-a' } })
+  assert(first.exitCode === 0, `the first call failed: ${JSON.stringify(first)}`)
+  const second = await use.execute({ ref: 'ONCE_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-a' } })
+  assert(second.status === 'refused', `once was not used up: ${JSON.stringify(second)}`)
+  assert(host.shellRuns.length === 1, `the second call still started a command (${host.shellRuns.length})`)
+
+  store.markStored('OLD_TOKEN', { scope: 'until', expiresAt: new Date(Date.now() - 1_000).toISOString() })
+  const expired = await use.execute({ ref: 'OLD_TOKEN', argv: ['echo', 'hi'] }, {})
+  assert(expired.status === 'refused', `an expired permission was allowed: ${JSON.stringify(expired)}`)
+})
+
+await check('㉗ a refused or cancelled request writes nothing at all', async () => {
+  const home = freshTuiHome('nowrite')
+  const headless = toolHost({ openResult: false })
+  apply(headless.ctx)
+  const request = toolNamed(headless.registered, 'request_credential')
+  const refused = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'test' }, { agent: { id: 'session-a' } })
+  assert(refused.status === 'refused', `a headless request was not refused: ${JSON.stringify(refused)}`)
+  assert(!fs.existsSync(recordFile(home)), 'the record file was written for a refusal')
+  assert(!fs.existsSync(auditFile(home)), 'the audit file was written for a refusal')
+
+  const cancelled = toolHost()
+  apply(cancelled.ctx)
+  const request2 = toolNamed(cancelled.registered, 'request_credential')
+  const controller = new AbortController()
+  controller.abort()
+  const aborted = await request2.execute({ ref: 'ALPHA_TOKEN', purpose: 'test' }, { agent: { id: 'session-a' }, signal: controller.signal })
+  assert(aborted.status === 'cancelled', `an aborted call was not cancelled: ${JSON.stringify(aborted)}`)
+  assert(!fs.existsSync(recordFile(home)), 'the record file was written for a cancellation')
+  assert(!fs.existsSync(auditFile(home)), 'the audit file was written for a cancellation')
+})
+
+await check('㉘ a v1 name index is read as v2 and a damaged one is never overwritten', async () => {
+  const home = freshTuiHome('compat')
+  fs.mkdirSync(path.dirname(recordFile(home)), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(recordFile(home), JSON.stringify({ version: 1, names: ['LEGACY_TOKEN'] }), { mode: 0o600 })
+  assert(store.loadNames().includes('LEGACY_TOKEN'), 'the v1 name was not imported')
+  store.markStored('LEGACY_TOKEN', { scope: 'once' })
+  const written = JSON.parse(fs.readFileSync(recordFile(home), 'utf8'))
+  assert(written.version === 2, `the file was not upgraded to v2: ${written.version}`)
+  assert(written.refs[0].scope === 'once', 'the permission was not recorded')
+
+  fs.writeFileSync(recordFile(home), '{ this is not json', { mode: 0o600 })
+  assert(store.loadNames().length === 0, 'a damaged file must read as empty')
+  store.addName('GAMMA_TOKEN')
+  assert(fs.readFileSync(recordFile(home), 'utf8').includes('GAMMA_TOKEN'), 'a fresh write after damage failed')
+})
+
+await check('㉚ the scene revokes: one reference and everything at once', async () => {
+  const home = freshTuiHome('revoke')
+  store.markStored('ALPHA_TOKEN', { scope: 'session', sessionId: 's' })
+  store.markStored('BETA_TOKEN', { scope: 'once' })
+  const revoked = []
+  const scene = plugin.__internals.makeScene({
+    getCredentials: () => ({ async describe() { return { configured: true, writable: true } }, async resolve() { return undefined }, async set() {}, async unset() {} }),
+    store: { loadNames: () => ['ALPHA_TOKEN', 'BETA_TOKEN'], addName: () => {}, removeName: () => {} },
+    logger: { info: () => {}, warn: () => {} },
+    records: () => store.loadRecords(),
+    revokeGrant: (ref) => { const done = store.revoke(ref); if (done) revoked.push(ref); return done },
+    revokeEveryGrant: () => { const list = store.revokeAll(); revoked.push(...list); return list },
+  })
+  const view = mount(scene, { channel: {}, close: () => {} })
+  await flush()
+  view.render()
+  assert(view.text.includes('agent use: session'), `the list does not show the permission: ${view.text}`)
+  view.press('v')
+  await flush()
+  assert(revoked.includes('ALPHA_TOKEN'), 'v did not revoke the selected reference')
+  assert(view.text.includes('revoked agent use for ALPHA_TOKEN'), `no feedback after v: ${view.text}`)
+  view.press('R')
+  view.press('y')
+  await flush()
+  assert(revoked.includes('BETA_TOKEN'), 'R + y did not revoke everything')
+  assert(store.loadRecords().every((record) => record.scope === 'none'), 'a permission survived the revoke-all')
+  const audit = fs.readFileSync(auditFile(home), 'utf8')
+  assert(audit.includes('"event":"revoked"'), 'the revoke was not audited')
+})
+
+await check('㉛ without a shell seam the tool refuses instead of throwing', async () => {
+  freshTuiHome('noshell')
+  store.markStored('ALPHA_TOKEN', { scope: 'once' })
+  const host = toolHost({ noShell: true })
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  const result = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['echo', 'hi'] }, {})
+  assert(result.status === 'refused', `a missing shell seam was not refused: ${JSON.stringify(result)}`)
+  assert(result.note.includes('shell'), `the note does not say why: ${result.note}`)
+})
+
+await check('㉜ the scene refuses a request when no TUI front end accepts it', async () => {
+  freshTuiHome('headless')
+  const host = toolHost({ openResult: false })
+  apply(host.ctx)
+  const scene = host.registered.scenes[0]
+  assert(scene && scene.id === 'secrets', 'the scene was not registered')
+  const request = toolNamed(host.registered, 'request_credential')
+  const result = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, {})
+  assert(result.status === 'refused', `a headless card was not refused: ${JSON.stringify(result)}`)
+})
+
+await check('㉝ a cancelled tool call settles the card and writes nothing', async () => {
+  const home = freshTuiHome('abort')
+  const host = toolHost()
+  apply(host.ctx)
+  const request = toolNamed(host.registered, 'request_credential')
+  const controller = new AbortController()
+  controller.abort()
+  const result = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, { signal: controller.signal })
+  assert(result.status === 'cancelled', `an aborted card was not cancelled: ${JSON.stringify(result)}`)
+  assert(!fs.existsSync(recordFile(home)) && !fs.existsSync(auditFile(home)), 'an aborted card wrote something')
+})
+
+await check('㉞ session scope is judged by session id and never clears itself', async () => {
+  const home = freshTuiHome('session')
+  const host = toolHost()
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  store.markStored('SESSION_TOKEN', { scope: 'session', sessionId: 'session-a' })
+  const mine = await use.execute({ ref: 'SESSION_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-a' } })
+  assert(mine.exitCode === 0, `the owning session was refused: ${JSON.stringify(mine)}`)
+  const theirs = await use.execute({ ref: 'SESSION_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-b' } })
+  assert(theirs.status === 'refused', `another session was allowed: ${JSON.stringify(theirs)}`)
+  const anonymous = await use.execute({ ref: 'SESSION_TOKEN', argv: ['echo', 'hi'] }, {})
+  assert(anonymous.status === 'refused', 'a call without a session id was allowed')
+  // Restoring the record (what a resumed session does: a new agent, the same session id) and
+  // running long after the request must still work — nothing clears a session permission.
+  const later = await use.execute({ ref: 'SESSION_TOKEN', argv: ['echo', 'hi'] }, { agent: { id: 'session-a' } })
+  assert(later.exitCode === 0, `the permission did not survive a resumed session: ${JSON.stringify(later)}`)
+  const record = store.loadRecords().find((entry) => entry.ref === 'SESSION_TOKEN')
+  assert(record.useCount === 2 && record.revokedAt === null, `the record drifted: ${JSON.stringify(record)}`)
+  assert(fs.readFileSync(auditFile(home), 'utf8').split('\n').filter((line) => line.includes('"used"')).length === 2, 'the audit misses a use')
+})
+
+await check('㉟ the card: the agent asks, the human picks a scope, the value is stored once', async () => {
+  freshTuiHome('card')
+  const settled = []
+  const setCalls = []
+  const pending = { ref: 'ALPHA_TOKEN', purpose: 'call the internal API', sessionId: 'session-a' }
+  const channel = {
+    request: async () => ({ kind: 'refused' }),
+    active: () => pending,
+    settle: (outcome) => { settled.push(outcome); return true },
+    subscribe: () => () => {},
+  }
+  const scene = plugin.__internals.makeScene({
+    getCredentials: () => ({ async describe() { return { configured: false, writable: true } }, async resolve() { return undefined }, async set(ref, value) { setCalls.push({ ref, value }) }, async unset() {} }),
+    store: { loadNames: () => [], addName: () => {}, removeName: () => {} },
+    logger: { info: () => {}, warn: () => {} },
+    channel,
+  })
+  const view = mount(scene, { channel: {}, close: () => {} })
+  await flush()
+  view.render()
+  assert(view.text.includes('A credential is requested'), `the card did not open: ${view.text}`)
+  assert(view.text.includes('call the internal API'), 'the purpose is not shown')
+  view.press('2')       // "agent may use it once"
+  view.press('\r', { return: true })
+  for (const ch of SENTINEL) view.press(ch)
+  assert(!view.text.includes(SENTINEL), 'the card echoed the value')
+  view.press('\r', { return: true })
+  await flush()
+  assert(setCalls.length === 1 && setCalls[0].value === SENTINEL, `the value never reached credentials.set: ${JSON.stringify(setCalls)}`)
+  assert(settled.length === 1 && settled[0].kind === 'stored' && settled[0].scope === 'once', `the card settled wrong: ${JSON.stringify(settled)}`)
+  assert(!JSON.stringify(settled).includes(SENTINEL), 'the settled outcome carries the value')
+  assert(view.frames.every((frame) => !frame.includes(SENTINEL)), 'a rendered frame holds the value')
+})
+
 // ---------------------------------------------------------------- the declaration gate
 // The plugin declaration is consumed twice: the community parser validates its structure
 // (and the host derives the plugin identity from projection.metadata.name), while the TUI

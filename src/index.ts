@@ -404,7 +404,7 @@ function requestCredentialTool(deps: ToolDeps): ToolDefinitionLike {
 function useCredentialTool(deps: ToolDeps): ToolDefinitionLike {
   return {
     name: USE_TOOL,
-    description: 'Run one command with a stored credential available in that child process only (the environment variable named in injectedAs). The credential never enters your own shell, and any occurrence of its value in the returned output is replaced with [credential].',
+    description: 'Run one command with a stored credential available in that child process only (the environment variable named in injectedAs). The credential never enters your own shell. Any occurrence of its value in the returned output is replaced with [credential] — that covers the returned slice, not a truncated or transformed copy, so do not echo the variable to read it.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -422,12 +422,14 @@ function useCredentialTool(deps: ToolDeps): ToolDefinitionLike {
     output: {
       schema: {
         type: 'object',
-        required: ['exitCode', 'stdout', 'stderr', 'redacted', 'injectedAs'],
+        required: ['exitCode', 'stdout', 'stderr', 'redacted', 'timedOut', 'aborted', 'injectedAs'],
         properties: {
           exitCode: { type: 'number' },
           stdout: { type: 'string' },
           stderr: { type: 'string' },
           redacted: { type: 'boolean' },
+          timedOut: { type: 'boolean' },
+          aborted: { type: 'boolean' },
           injectedAs: { type: 'string' },
         },
       },
@@ -526,9 +528,17 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
     const [, bumpPaint] = React.useState(0)
     const repaint = (): void => bumpPaint((n) => n + 1)
 
-    // A card opened by the agent has to reach us even when the scene is already on screen.
+    // A card opened by the agent has to reach us even when the scene is already on screen:
+    // the channel notifies on every appear/disappear, and the pending request decides the mode.
     React.useEffect(() => channel.subscribe(() => repaint()), [])
     const request = channel.active()
+
+    React.useEffect(() => {
+      if (!request || mode !== 'list') return undefined
+      setScope(offeredScopes(request.sessionId)[0])
+      setMode('request-scope')
+      return undefined
+    }, [request, mode])
 
     // `grant` is what the record says; the list is where the human sees (and revokes) it.
     const grantLabel = (name: string): string => {
@@ -613,6 +623,13 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
           const secretName = initialiseName(nameBuf)
           if (!credentials) { setNotice('credentials service unavailable, nothing written'); back(); return }
           if (valueRef.current.length === 0) { setNotice('empty value, nothing written (an empty value means unconfigured)'); back(); return }
+          if (process.env[secretName]) {
+            // The process environment outranks the credential file, so the write would look like
+            // a success while every consumer keeps reading the environment value. Refuse.
+            setNotice(`${secretName} is already set in this process environment, which outranks the credential file; unset it first`)
+            back()
+            return
+          }
           const payload = valueRef.current
           valueRef.current = '' // dropped locally before the write, so a failure leaves nothing behind
           setMode('list')
@@ -651,17 +668,31 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
       if (mode === 'request-value') {
         if (key?.escape) { valueRef.current = ''; setMode('request-scope'); return }
         if (key?.return) {
+          const secretName = initialiseName(request?.ref ?? '')
           if (!credentials) { channel.settle({ kind: 'refused' }); setNotice('credentials service unavailable, nothing written'); back(); return }
           if (valueRef.current.length === 0) { setNotice('empty value, nothing written'); return }
-          const secretName = initialiseName(request?.ref ?? '')
+          if (process.env[secretName]) {
+            // Same rule as the manual path: an environment value outranks the file, so a write
+            // here would only look successful. Tell the agent "refused" and write nothing.
+            channel.settle({ kind: 'refused' })
+            setNotice(`${secretName} is already set in this process environment; unset it first`)
+            back()
+            return
+          }
           const payload = valueRef.current
           valueRef.current = ''
-          channel.settle({ kind: 'stored', scope })
           setMode('list')
+          // The card is settled only after the store accepted the value: a tool that answered
+          // "stored" while the write was still failing would be lying to the model.
           void Promise.resolve()
             .then(() => credentials.set(secretName, payload))
-            .then(() => { setNotice(`wrote ${secretName} (${SCOPE_LABEL[scope]})`); refresh() })
+            .then(() => {
+              channel.settle({ kind: 'stored', scope })
+              setNotice(`wrote ${secretName} (${SCOPE_LABEL[scope]})`)
+              refresh()
+            })
             .catch((error: unknown) => {
+              channel.settle({ kind: 'refused' })
               logger.warn(`set ${secretName} failed: ${failureLabel(error)}`)
               setNotice(`write failed (${failureLabel(error)})`)
             })
