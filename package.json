@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui-secret",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Secure secret entry for dsh-TUI: a /secrets scene that writes through the DSH credentials seam.",
   "author": "zerodegress <zerodegress@outlook.com>",
   "type": "module",
@@ -16,7 +16,6 @@
   },
   "files": [
     "lib",
-    "bin",
     "docs",
     "scripts",
     "cordis.patch.yml",
@@ -41,7 +40,8 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p tsconfig.json",
+    "clean": "node scripts/clean-lib.mjs",
+    "compile": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run compile",
     "test": "node scripts/verify.mjs",
@@ -69,8 +69,5 @@
   "homepage": "https://github.com/zerodegress/dsh-tui-secret#readme",
   "bugs": {
     "url": "https://github.com/zerodegress/dsh-tui-secret/issues"
-  },
-  "bin": {
-    "dsh-tui-secret": "bin/dsh-tui-secret.mjs"
   }
 }

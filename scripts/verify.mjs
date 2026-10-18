@@ -469,187 +469,76 @@ await check('⑫ real host render (real React + real ink): the mask repaints and
   }
 })
 
-// ---------------------------------------------------------------- the CLI (the other half of the same code)
-const CLI_PATH = new URL('../bin/dsh-tui-secret.mjs', import.meta.url).pathname
+// ---------------------------------------------------------------- quoting: the model's argv is data, not shell text
+// `use_credential` takes an argv array and builds the command string itself (the shell seam
+// wants a string), so the quoting is our attack surface. It is proved against a real /bin/sh
+// rather than by reading the code: whatever the model sends stays data, and only a script the
+// model writes itself — `['sh','-c','…']` — is expanded, by that inner shell.
+const { quoteArg, toCommand, runWithCredential, injectedName } = await import('../lib/types/use.js')
 
-function cliRun(args, { home, tui, input }) {
-  const env = { ...process.env, DSH_HOME: home, DSH_TUI_HOME: tui }
-  delete env.DSH_TUI_PROFILE
-  return spawnSync(process.execPath, [CLI_PATH, ...args], { input, encoding: 'utf8', env })
-}
-
-function freshHome() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tui-secret-cli-'))
-  const tui = path.join(home, 'tui-home')
-  fs.mkdirSync(tui, { recursive: true })
-  return { home, tui, file: path.join(home, '.credentials.yaml') }
-}
-
-function seedCredentials(file, text) {
-  fs.writeFileSync(file, text, { mode: 0o600 })
-  fs.chmodSync(file, 0o600)
-}
-
-/** Parse with the host's yaml package: proof that the provider reads back exactly what we wrote. */
-async function parseWithHostYaml(text) {
-  const candidates = [
-    path.join(os.homedir(), '.dsh/profiles/dsh-tui/node_modules/yaml/dist/index.js'),
-    path.join(os.homedir(), '.bun/install/global/node_modules/yaml/dist/index.js'),
-  ]
-  const found = candidates.find((candidate) => fs.existsSync(candidate))
-  if (!found) return undefined
-  const { pathToFileURL } = await import('node:url')
-  const { parse } = await import(pathToFileURL(found).href)
-  return parse(text)
-}
-
-const CLI_SECRET = 'CLI_SENTINEL_do_not_leak_91bd'
-
-await check('⑬ cli set: a row-level upsert — comments, other keys and block scalars survive', async () => {
-  const { home, tui, file } = freshHome()
-  const original = '# kept comment\nALPHA: a\nPEM: |\n  line1\n  line2\n'
-  seedCredentials(file, original)
-
-  const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
-  assert(result.status === 0, `set exited ${result.status}: ${result.stderr}`)
-  assert(!result.stdout.includes(CLI_SECRET) && !result.stderr.includes(CLI_SECRET), 'the value appeared on stdout/stderr')
-
-  const after = fs.readFileSync(file, 'utf8')
-  assert(after.includes('# kept comment'), 'the comment was eaten')
-  assert(after.includes('ALPHA: a'), 'another key was rewritten')
-  assert(after.includes('PEM: |\n  line1\n  line2\n'), 'the block scalar was rewritten')
-  assert(after.trimEnd().endsWith(`BETA: "${CLI_SECRET}"`), `the new key was not appended: ${JSON.stringify(after)}`)
-  assert((fs.statSync(file).mode & 0o777) === 0o600, `mode is not 600: ${(fs.statSync(file).mode & 0o777).toString(8)}`)
-  assert(!fs.existsSync(`${file}.lock`), 'the lock file was left behind')
-  assert(fs.readdirSync(home).every((name) => !name.endsWith('.tmp')), 'a temporary file was left behind')
-
-  const parsed = await parseWithHostYaml(after)
-  if (parsed === undefined) throw new Skip('no yaml package available, skipping the provider-readback half')
-  assert(parsed.BETA === CLI_SECRET, 'the provider parses a different value than the one written')
-  assert(parsed.ALPHA === 'a' && parsed.PEM === 'line1\nline2\n', 'the other keys no longer parse to their values')
-})
-
-await check('⑭ cli set over an existing key: only that row changes, every other byte stays', async () => {
-  const { home, tui, file } = freshHome()
-  const original = '# c\nALPHA: a\nPEM: |\n  line1\n  line2\n'
-  seedCredentials(file, original)
-  assert(cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: 'first' }).status === 0, 'the first write failed')
-  const once = fs.readFileSync(file, 'utf8')
-  assert(cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: 'second' }).status === 0, 'the second write failed')
-  const twice = fs.readFileSync(file, 'utf8')
-  assert(once.split('\n').length === twice.split('\n').length, 'the overwrite changed the row count (a whole-document rewrite?)')
-  assert(twice.includes('# c') && twice.includes('PEM: |\n  line1\n  line2\n'), 'the overwrite touched another key')
-  assert(twice.includes('ALPHA: "second"'), `the overwrite did not take effect: ${JSON.stringify(twice)}`)
-  assert(!twice.includes('first'), 'the old value is still in the file')
-})
-
-await check('⑮ cli and provider share one lock: a held lock means an error exit and no write', async () => {
-  const { home, tui, file } = freshHome()
-  seedCredentials(file, 'ALPHA: a\n')
-  const lockPath = `${file}.lock`
-  fs.writeFileSync(lockPath, '12345\n', { mode: 0o600, flag: 'wx' })
-  try {
-    const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
-    assert(result.status === 2, `a held lock should exit 2, exited ${result.status}`)
-    assert(result.stderr.includes('writer lock'), `the error does not name the lock: ${result.stderr}`)
-    assert(result.stderr.includes(lockPath), `the error does not give the lock path: ${result.stderr}`)
-    assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'the file changed while the lock was held')
-  } finally {
-    fs.rmSync(lockPath, { force: true })
+/** A stand-in for ctx.shell that really runs the command string through /bin/sh. */
+function shellStub() {
+  const seen = []
+  return {
+    seen,
+    resolve(request) { seen.push(request); return request },
+    async execute(spec) {
+      const run = spawnSync('/bin/sh', ['-c', spec.command], {
+        env: { ...process.env, ...(spec.env ?? {}) },
+        encoding: 'utf8',
+      })
+      return { result: async () => ({ exitCode: run.status ?? -1, stdout: run.stdout, stderr: run.stderr, timedOut: false, aborted: false }) }
+    },
   }
+}
 
-  // And once more against the provider's own withFileLock (only when it is installed).
-  const atomicEntry = [
-    path.join(os.homedir(), '.bun/install/global/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js'),
-    path.join(os.homedir(), '.dsh/profiles/dsh-tui/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js'),
-  ].find((candidate) => fs.existsSync(candidate))
-  if (atomicEntry === undefined) throw new Skip('no dsh-atomic-write, skipping the real-lock collision half')
-  const { pathToFileURL } = await import('node:url')
-  const { withFileLock } = await import(pathToFileURL(atomicEntry).href)
-  await withFileLock(file, async () => {
-    const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
-    assert(result.status === 2, `with the provider holding the lock the exit should be 2, was ${result.status}`)
-    assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'the file changed while the provider held the lock')
+await check('⑬ hostile argv stays data: metacharacters, quotes, backticks, newline and an empty argument', async () => {
+  const hostile = ['printf', '%s\\n', 'a; rm -rf /', '$(id)', '`id`', '"double"', "it's", 'line\nbreak', '']
+  assert(quoteArg("it's") === "'it'\\''s'", `a single quote is not escaped: ${quoteArg("it's")}`)
+  let threw = false
+  try { toCommand([]) } catch { threw = true }
+  assert(threw, 'an empty argv must be refused, not turned into an empty command')
+
+  const shell = shellStub()
+  const result = await runWithCredential(shell, { ref: 'ALPHA', argv: hostile, value: 'NOT_IN_OUTPUT', timeoutMs: 5_000 })
+  // `printf '%s\n' a b c` prints one argument per line, so exact equality proves every argument
+  // arrived whole — including the one holding a real newline (it must not split the command).
+  const expected = hostile.slice(2).join('\n') + '\n'
+  assert(result.exitCode === 0, `the hostile command failed: exit ${result.exitCode} ${result.stderr}`)
+  assert(result.stdout === expected, `an argument did not arrive as data:\n${JSON.stringify(result.stdout)}\n!==\n${JSON.stringify(expected)}`)
+  assert(result.stdout.split('\n')[0] === 'a; rm -rf /', `metacharacters were interpreted: ${JSON.stringify(result.stdout.split('\n')[0])}`)
+  assert(result.stdout.includes('$(id)') && result.stdout.includes('`id`'), 'command substitution ran')
+  assert(shell.seen[0].env[injectedName('ALPHA')] === 'NOT_IN_OUTPUT', 'the value was not put in the child env')
+})
+
+await check('⑭ the value does not expand outside a shell the model writes itself', async () => {
+  const shell = shellStub()
+  const result = await runWithCredential(shell, {
+    ref: 'ALPHA',
+    argv: ['echo', `$${injectedName('ALPHA')}`],
+    value: 'CLI_SENTINEL_QUOTING_4f21',
+    timeoutMs: 5_000,
   })
+  assert(result.exitCode === 0, `echo failed: ${result.stderr}`)
+  assert(result.stdout === '$DSH_SECRET_ALPHA\n', `the value expanded where it must not: ${JSON.stringify(result.stdout)}`)
+  assert(!result.stdout.includes('CLI_SENTINEL_QUOTING_4f21'), 'the value reached the output untouched')
+  assert(result.redacted === false, 'nothing needed redaction here')
 })
 
-await check('⑯ cli fail-closed: no source / empty value / reserved prefix / shadowed / wide mode all refuse and write nothing', async () => {
-  const { home, tui, file } = freshHome()
-  seedCredentials(file, 'ALPHA: a\n')
-  const before = fs.readFileSync(file, 'utf8')
-
-  const noSource = cliRun(['set', 'BETA'], { home, tui, input: '' })
-  assert(noSource.status === 2 && noSource.stderr.includes('--from-stdin'), `a non-TTY with no source should refuse: ${noSource.status} ${noSource.stderr}`)
-  assert(!noSource.stdout.includes('written'), 'a refusal path reported success')
-
-  const empty = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: '' })
-  assert(empty.status === 2 && empty.stderr.includes('empty'), `an empty value should refuse: ${empty.stderr}`)
-
-  const reserved = cliRun(['set', 'DSH_SOMETHING', '--from-stdin'], { home, tui, input: CLI_SECRET })
-  assert(reserved.status === 2 && reserved.stderr.includes('host'), `a DSH_ prefix should refuse: ${reserved.stderr}`)
-
-  const shadowed = cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: CLI_SECRET })
-  assert(shadowed.status === 0, 'a normal write without shadowing should succeed')
-  seedCredentials(file, before)
-  const envHome = { ...process.env, DSH_HOME: home, DSH_TUI_HOME: tui, SHADOW_ME: 'x' }
-  const shadowRun = spawnSync(process.execPath, [CLI_PATH, 'set', 'SHADOW_ME', '--from-stdin'], { input: CLI_SECRET, encoding: 'utf8', env: envHome })
-  assert(shadowRun.status === 2 && shadowRun.stderr.includes('shadowed'), `an environment-shadowed write should refuse: ${shadowRun.status} ${shadowRun.stderr}`)
-
-  fs.chmodSync(file, 0o644)
-  const wide = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
-  assert(wide.status === 2 && wide.stderr.includes('chmod 600'), `a wide mode should refuse: ${wide.stderr}`)
-  fs.chmodSync(file, 0o600)
-
-  assert(fs.readFileSync(file, 'utf8') === before, 'one of the fail-closed paths wrote to disk')
-})
-
-await check('⑰ cli rm: refused without --yes; with it, only that key goes', async () => {
-  const { home, tui, file } = freshHome()
-  seedCredentials(file, '# c\nALPHA: a\nBETA: b\n')
-  const refused = cliRun(['rm', 'BETA'], { home, tui })
-  assert(refused.status === 2, `without --yes the exit should be 2: ${refused.status}`)
-  assert(fs.readFileSync(file, 'utf8').includes('BETA: b'), 'a key was deleted without --yes')
-
-  const ok = cliRun(['rm', 'BETA', '--yes'], { home, tui })
-  assert(ok.status === 0, `rm failed: ${ok.stderr}`)
-  const after = fs.readFileSync(file, 'utf8')
-  assert(!after.includes('BETA'), 'the key was not removed')
-  assert(after.includes('# c') && after.includes('ALPHA: a'), 'removing one key touched another row')
-
-  // Deleting down to comments only: comments survive (we remove one key's span, nothing else).
-  assert(cliRun(['rm', 'ALPHA', '--yes'], { home, tui }).status === 0, 'the second deletion failed')
-  assert(fs.readFileSync(file, 'utf8') === '# c\n', `with only comments left they should stay: ${JSON.stringify(fs.readFileSync(file, 'utf8'))}`)
-
-  // Without comments: emptying the document lands on {} like the provider.
-  const bare = freshHome()
-  seedCredentials(bare.file, 'ALPHA: a\n')
-  assert(cliRun(['rm', 'ALPHA', '--yes'], { home: bare.home, tui: bare.tui }).status === 0, 'emptying the document failed')
-  assert(fs.readFileSync(bare.file, 'utf8') === '{}\n', `an emptied document should be {}: ${JSON.stringify(fs.readFileSync(bare.file, 'utf8'))}`)
-})
-
-await check('⑱ cli list: names and state only, no value anywhere in the output', async () => {
-  const { home, tui, file } = freshHome()
-  seedCredentials(file, `ALPHA: "${CLI_SECRET}"\n`)
-  const plain = cliRun(['list'], { home, tui })
-  assert(plain.status === 0, `list failed: ${plain.stderr}`)
-  assert(plain.stdout.includes('ALPHA'), 'list did not show the key')
-  assert(!plain.stdout.includes(CLI_SECRET), 'a value appeared in list output')
-  const json = cliRun(['list', '--json'], { home, tui })
-  assert(json.status === 0, `list --json failed: ${json.stderr}`)
-  assert(!json.stdout.includes(CLI_SECRET), 'a value appeared in the JSON output')
-  const parsedJson = JSON.parse(json.stdout)
-  assert(parsedJson[0]?.name === 'ALPHA' && parsedJson[0]?.state === 'configured', `wrong JSON shape: ${json.stdout}`)
-})
-
-await check('⑲ cli set --dry-run: no write, no lock', async () => {
-  const { home, tui, file } = freshHome()
-  seedCredentials(file, 'ALPHA: a\n')
-  const result = cliRun(['set', 'BETA', '--from-stdin', '--dry-run'], { home, tui, input: CLI_SECRET })
-  assert(result.status === 0, `dry-run failed: ${result.stderr}`)
-  assert(result.stdout.includes('[dry-run]'), 'dry-run was not marked as such')
-  assert(!result.stdout.includes(CLI_SECRET), 'dry-run printed the value')
-  assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'dry-run wrote to disk')
-  assert(!fs.existsSync(`${file}.lock`), 'dry-run created a lock')
+await check('⑮ a script the model writes itself is expanded — and its output is still redacted', async () => {
+  const shell = shellStub()
+  const value = 'CLI_SENTINEL_QUOTING_4f21'
+  const result = await runWithCredential(shell, {
+    ref: 'ALPHA',
+    argv: ['sh', '-c', `printf 'token=%s\\n' "$${injectedName('ALPHA')}"`],
+    value,
+    timeoutMs: 5_000,
+  })
+  assert(result.exitCode === 0, `sh -c failed: ${result.stderr}`)
+  assert(result.stdout === 'token=[credential]\n', `the inner script's output was not redacted: ${JSON.stringify(result.stdout)}`)
+  assert(result.redacted === true, 'the redaction flag was not set')
+  assert(result.injectedAs === injectedName('ALPHA'), `wrong env name reported: ${result.injectedAs}`)
+  assert(!result.stdout.includes(value) && !result.stderr.includes(value), 'the value survived in the returned output')
 })
 
 // ---------------------------------------------------------------- the declaration gate

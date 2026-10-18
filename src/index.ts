@@ -1,5 +1,4 @@
-// dsh-tui-secret — secure secret entry inside dsh-TUI (a value only ever reaches
-// ctx.credentials).
+// dsh-tui-secret — the agent asks, the human answers, and the value never travels back.
 //
 // Plugin contract (tui-profile plugin guide, "plugin contract"):
 //   - the package root exports `name` / `apply`, with no default export;
@@ -7,21 +6,30 @@
 //     the TUI must always start;
 //   - resources are released through ctx.effect(() => () => dispose()).
 //
-// The three seams this plugin uses, and why:
-//   - tuiScenes registers the `/secrets` full-screen scene. Masked input has to happen on
-//     a screen we render ourselves: dsh-TUI 0.16.0 already declares a `secret` field for
-//     settings sections, but its settings screen does not render a mask yet.
-//   - the scene is opened by our own slash command, whose name comes from
-//     `config.entryCommand`.
-//   - credentials (a DSH core service) is the only write surface:
-//     resolve / describe / set / unset. It has no list(), so "which names were recorded"
-//     has to be stored here (store.ts, names only).
+// What this plugin is (0.2.0): two model-facing tools and no CLI.
+//   request_credential(ref, purpose) — the agent asks; the human gets a masked card; the value
+//     goes straight into the DSH credential store; the tool returns only a status.
+//   use_credential(ref, argv) — run one command with the value present in exactly one child
+//     process (never in the agent's own environment), then return output with the value
+//     replaced by `[credential]`. Every scope (none / once / session / until) is enforced here,
+//     at the tool entry, because this tool is the only way the agent can use a value.
 //
-// The host seams below are typed structurally on purpose: this package declares only the
-// little it consumes, so a host release that changes an unrelated part of `Context` does
-// not break the build here (and no host type package is needed to compile).
-import { describeNameProblem, initialiseName, loadNames, addName, removeName } from './store.js'
-// A type-only import: it is erased at compile time. It sits after the value import so the
+// The two card seams this plugin uses, and why:
+//   - tuiScenes renders the `/secrets` scene: list + manual entry + the request card.
+//   - credentials (a DSH core service) is the only place a value is written or read.
+// Everything else is optional and probed with `ctx.get(name, false)`, so a missing seam can
+// never keep the TUI from starting.
+//
+// The host seams below are typed structurally on purpose: this package declares only the little
+// it consumes, so a host release that changes an unrelated part of `Context` does not break the
+// build here (and no host type package is needed to compile).
+import { describeNameProblem, initialiseName, loadNames, addName, removeName, loadRecords, markStored, markUsed, appendAudit, authorised, revoke, revokeAll } from './store.js'
+import type { RefRecord, Scope } from './store.js'
+import { SceneChannel, RefusingChannel } from './card.js'
+import type { CardChannel, CardRequest, ScenesSeam } from './card.js'
+import { runWithCredential } from './use.js'
+import type { ShellSeam } from './use.js'
+// A type-only import: it is erased at compile time. It sits after the value imports so the
 // header above survives into the emitted file (tsc drops a comment attached to a removed
 // `import type` statement).
 import type { Context } from '@deepseek-ai/cordis'
@@ -30,6 +38,14 @@ export const name = 'dsh-tui-secret' as const
 
 /** Scene id: kebab-case, globally unique. */
 const SCENE_ID = 'secrets'
+
+/** The two model-facing tools; these names are the model's whole vocabulary here. */
+const REQUEST_TOOL = 'request_credential'
+const USE_TOOL = 'use_credential'
+
+/** `use_credential` defaults (the executor may cap the timeout further). */
+const DEFAULT_TIMEOUT_MS = 30_000
+const MAX_TIMEOUT_MS = 300_000
 
 /** The one configuration key (defaulted; a missing key degrades to the default behaviour and never breaks TUI startup). */
 export interface Config {
@@ -63,6 +79,7 @@ interface CredentialInfo {
 
 interface CredentialsSeam {
   describe(name: string): Promise<CredentialInfo>
+  resolve(name: string): Promise<{ value: string; source: string } | undefined>
   set(name: string, value: string): Promise<unknown>
   unset(name: string): Promise<unknown>
 }
@@ -76,9 +93,8 @@ interface SceneDescriptor {
   component: SceneComponent
 }
 
-interface ScenesSeam {
+interface ScenesRegisterSeam extends ScenesSeam {
   register(descriptor: SceneDescriptor, owner?: unknown): () => void
-  open(id: string): boolean
 }
 
 interface CommandResult {
@@ -101,6 +117,29 @@ interface PluginHostSeam {
   registerCommand(owner: unknown, definition: CommandDefinition): () => void
 }
 
+/** What the tool registry hands back on each call. */
+interface ToolRunContextLike {
+  agent?: { id?: string }
+  callId?: string
+  signal?: AbortSignal
+}
+
+/** One model-facing tool definition (see design §2.1 for the host's own shape). */
+interface ToolDefinitionLike {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  output: {
+    schema: Record<string, unknown>
+    render(args: unknown, value: unknown): unknown[]
+  }
+  execute(args: unknown, exec: ToolRunContextLike): Promise<unknown>
+}
+
+interface ToolsSeam {
+  register(definition: ToolDefinitionLike): () => void
+}
+
 /**
  * The part of the Cordis context this plugin touches. `inject` hands the callback the same
  * context with the named services mounted, which is why the callback receives this shape too.
@@ -112,8 +151,10 @@ interface HostSeams {
   logger?: Partial<Logger>
   credentials?: CredentialsSeam
   commands?: CommandsSeam
-  tuiScenes?: ScenesSeam
+  tuiScenes?: ScenesRegisterSeam
   tuiPluginHost?: PluginHostSeam
+  tools?: ToolsSeam
+  shell?: ShellSeam
 }
 
 // ------------------------------------------------------------------ the scene's own React/ui surface
@@ -155,11 +196,25 @@ interface SceneProps {
 interface Row {
   name: string
   state: string
+  grant: string
 }
 
-type Mode = 'list' | 'name' | 'value' | 'confirm'
+type Mode = 'list' | 'name' | 'value' | 'confirm' | 'request-scope' | 'request-value' | 'revoke-all'
 
-/** The name index as the scene sees it (names only; `store.ts` owns the file). */
+/** How the four scopes read on the screen. */
+const SCOPE_LABEL: Record<Scope, string> = {
+  none: 'agent use not allowed',
+  once: 'agent may use it once',
+  session: 'agent may use it in this session',
+  until: 'agent may use it until it expires',
+}
+
+/** The scopes the card offers: `session` only when we actually know the session id. */
+function offeredScopes(sessionId: string | undefined): Scope[] {
+  return sessionId ? ['none', 'once', 'session', 'until'] : ['none', 'once', 'until']
+}
+
+/** The name index as the scene sees it (names only; `store.ts` owns the files). */
 interface NameStore {
   loadNames(): string[]
   addName(name: string): string[]
@@ -172,9 +227,19 @@ function failureLabel(error: unknown): string {
   return String(failure?.code || failure?.name || 'unknown')
 }
 
+/** The tool result a model sees: a status, never a value. */
+function text(value: unknown): unknown[] {
+  return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
+}
+
+/** One request as the plugin tracks it while the human decides. */
+interface PendingRequest extends CardRequest {
+  sessionId: string | undefined
+}
+
 /**
- * Plugin entry. Registers two seams declaratively through ctx.inject; every resource is
- * disposed on the fibre that called apply.
+ * Plugin entry. Registers the scene, the slash command and the two model-facing tools; every
+ * resource is disposed on the fibre that called apply.
  *
  * @param ctx - the Cordis context.
  * @param config - from cordis.patch.yml.
@@ -183,8 +248,6 @@ export function apply(ctx: Context, config?: Config): void {
   const options: Required<Config> = { ...DEFAULTS, ...(config ?? {}) }
   const seams = ctx as unknown as HostSeams
 
-  // The index of recorded reference names (names only; values belong to dsh-credentials
-  // and are never read here).
   const store: NameStore = {
     loadNames: () => loadNames(),
     addName: (n: string) => addName(n),
@@ -201,8 +264,24 @@ export function apply(ctx: Context, config?: Config): void {
   // Resolved per use rather than remembered: credentials is another plugin's service and
   // may be mounted after this apply runs.
   const getCredentials = (): CredentialsSeam | undefined => seams.get<CredentialsSeam>('credentials', false) ?? seams.credentials
+  const getShell = (): ShellSeam | undefined => seams.get<ShellSeam>('shell', false) ?? seams.shell
 
-  const scene = makeScene({ getCredentials, store, logger })
+  // The card: our own scene is both the renderer and the answer path (design §2.2).
+  const channel: CardChannel = new SceneChannel(
+    { open: (id: string) => seams.get<ScenesRegisterSeam>('tuiScenes', false)?.open(id) ?? false },
+    SCENE_ID,
+    logger,
+  )
+
+  const scene = makeScene({
+    getCredentials,
+    store,
+    logger,
+    channel,
+    records: () => loadRecords(),
+    revokeGrant: (ref: string) => revoke(ref),
+    revokeEveryGrant: () => revokeAll(),
+  })
 
   seams.inject(['tuiScenes'], (sceneCtx) => {
     const dispose = sceneCtx.tuiScenes!.register(
@@ -218,7 +297,7 @@ export function apply(ctx: Context, config?: Config): void {
       name: options.entryCommand,
       description: 'Enter, list or delete secrets (values are never echoed and never reach the conversation)',
       handler: (): CommandResult => {
-        const scenes = seams.get<ScenesSeam>('tuiScenes', false)
+        const scenes = seams.get<ScenesRegisterSeam>('tuiScenes', false)
         if (!scenes?.open) {
           return { kind: 'error', text: 'dsh-TUI provides no scene surface (tuiScenes), so /secrets cannot open' }
         }
@@ -228,13 +307,6 @@ export function apply(ctx: Context, config?: Config): void {
           : { kind: 'error', text: 'the secrets scene is not registered (the plugin may be disabled)' }
       },
     }
-    // The mediated surface comes first (C-041): a command registered through it carries
-    // this plugin's verified identity, which is what lets the host's invoke checkpoint
-    // honour per-owner denies (revoking `commands.invoke` then closes this entry point).
-    // When the mediated surface is absent (older patch, or admission refused) we fall
-    // back to a direct registration, which the same-process trust boundary (C-070)
-    // explicitly allows — it simply carries no attribution. Both paths return the same
-    // disposer shape.
     let dispose: (() => void) | undefined
     const host = seams.get<PluginHostSeam>('tuiPluginHost', false)
     if (host?.registerCommand) {
@@ -251,6 +323,172 @@ export function apply(ctx: Context, config?: Config): void {
     }
     seams.effect(() => () => dispose!())
   })
+
+  registerTools({ seams, logger, channel, getCredentials, getShell })
+}
+
+/** Where the two tools get their seams from; absent seams degrade to a refusal, never a crash. */
+interface ToolDeps {
+  seams: HostSeams
+  logger: Logger
+  channel: CardChannel
+  getCredentials(): CredentialsSeam | undefined
+  getShell(): ShellSeam | undefined
+}
+
+/** Register both tools if the host has a tool registry (it may mount after this apply runs). */
+function registerTools(deps: ToolDeps): void {
+  const { seams, logger } = deps
+  const register = (definition: ToolDefinitionLike): void => {
+    const tools = seams.get<ToolsSeam>('tools', false)
+    if (!tools?.register) {
+      logger.warn(`no tools seam: ${definition.name} is not registered and the agent cannot call it`)
+      return
+    }
+    const dispose = tools.register(definition)
+    seams.effect(() => () => dispose())
+    logger.info(`tool ${definition.name} registered`)
+  }
+
+  register(requestCredentialTool(deps))
+  register(useCredentialTool(deps))
+}
+
+/** `request_credential`: the agent asks, the human decides; only a status goes back. */
+function requestCredentialTool(deps: ToolDeps): ToolDefinitionLike {
+  return {
+    name: REQUEST_TOOL,
+    description: 'Ask the user for a credential (by name) and store it. The user sees a masked card; the value goes straight into the credential store and is never returned to you. Returns only stored, cancelled or refused.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ref', 'purpose'],
+      properties: {
+        ref: { type: 'string', description: 'Credential name, e.g. ALPHA_TOKEN (uppercase letters, digits, underscore).' },
+        purpose: { type: 'string', description: 'What you need it for, shown to the user on the card.' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        required: ['status', 'ref'],
+        properties: { status: { type: 'string' }, ref: { type: 'string' }, note: { type: 'string' } },
+      },
+      render: (_args, value) => text(value),
+    },
+    execute: async (rawArgs, exec) => {
+      const args = (rawArgs ?? {}) as { ref?: unknown; purpose?: unknown }
+      const ref = initialiseName(args.ref)
+      const problem = describeNameProblem(ref)
+      if (problem) return { status: 'refused', ref, note: problem }
+      const purpose = String(args.purpose ?? '').slice(0, 200)
+      if (purpose === '') return { status: 'refused', ref, note: 'purpose is required' }
+
+      const sessionId = exec?.agent?.id
+      const outcome = await deps.channel.request({ ref, purpose, sessionId } as PendingRequest, { signal: exec?.signal })
+      if (outcome.kind !== 'stored') {
+        // A refusal or a cancellation writes nothing at all — no record, no audit line.
+        deps.logger.info(`${REQUEST_TOOL} ${ref}: ${outcome.kind}`)
+        return { status: outcome.kind, ref, note: outcome.kind === 'refused' ? 'the user refused, or no card could be shown' : undefined }
+      }
+      markStored(ref, { scope: outcome.scope, purpose, sessionId })
+      appendAudit({ event: 'request', ref, purpose, sessionId })
+      appendAudit({ event: 'stored', ref, purpose, sessionId })
+      deps.logger.info(`${REQUEST_TOOL} ${ref}: stored (${outcome.scope})`)
+      return { status: 'stored', ref }
+    },
+  }
+}
+
+/** `use_credential`: run one command with the value in that child process only. */
+function useCredentialTool(deps: ToolDeps): ToolDefinitionLike {
+  return {
+    name: USE_TOOL,
+    description: 'Run one command with a stored credential available in that child process only (the environment variable named in injectedAs). The credential never enters your own shell, and any occurrence of its value in the returned output is replaced with [credential].',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ref', 'argv'],
+      properties: {
+        ref: { type: 'string', description: 'Credential name previously stored through request_credential.' },
+        argv: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Command and arguments. Each element is passed through untouched; the plugin quotes them, so write ["sh","-c","…"] yourself when you need shell features.',
+        },
+        timeoutMs: { type: 'number', description: `Optional timeout (default ${DEFAULT_TIMEOUT_MS}, at most ${MAX_TIMEOUT_MS}).` },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        required: ['exitCode', 'stdout', 'stderr', 'redacted', 'injectedAs'],
+        properties: {
+          exitCode: { type: 'number' },
+          stdout: { type: 'string' },
+          stderr: { type: 'string' },
+          redacted: { type: 'boolean' },
+          injectedAs: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(value),
+    },
+    execute: async (rawArgs, exec) => {
+      const args = (rawArgs ?? {}) as { ref?: unknown; argv?: unknown; timeoutMs?: unknown }
+      const ref = initialiseName(args.ref)
+      const problem = describeNameProblem(ref)
+      if (problem) return refusal(ref, problem)
+      if (!Array.isArray(args.argv) || args.argv.length === 0 || args.argv.some((item) => typeof item !== 'string')) {
+        return refusal(ref, 'argv must be a non-empty array of strings')
+      }
+
+      const shell = deps.getShell()
+      if (!shell?.execute) return refusal(ref, 'this host provides no shell surface, so the command cannot run')
+      const credentials = deps.getCredentials()
+      if (!credentials?.resolve) return refusal(ref, 'the credentials service is unavailable')
+
+      const sessionId = exec?.agent?.id
+      const decision = authorisedFor(ref, sessionId)
+      if (!decision.ok) return refusal(ref, `not allowed: ${decision.why}`)
+
+      let value: string
+      try {
+        const resolved = await credentials.resolve(ref)
+        if (!resolved?.value) return refusal(ref, 'the credential is not configured')
+        value = resolved.value
+      } catch (error) {
+        return refusal(ref, `could not read the credential (${failureLabel(error)})`)
+      }
+
+      const timeoutMs = clampTimeout(args.timeoutMs)
+      try {
+        const result = await runWithCredential(shell, { ref, argv: args.argv as string[], value, timeoutMs, signal: exec?.signal })
+        markUsed(ref)
+        appendAudit({ event: 'used', ref, sessionId, exitCode: result.exitCode })
+        if (result.redacted) appendAudit({ event: 'redacted', ref, sessionId })
+        deps.logger.info(`${USE_TOOL} ${ref}: exit ${result.exitCode}${result.redacted ? ' (redacted)' : ''}`)
+        return result
+      } catch (error) {
+        return refusal(ref, `the command could not run (${failureLabel(error)})`)
+      }
+    },
+  }
+}
+
+/** Read the record and judge the window at the entry (design §2.3); never cached. */
+function authorisedFor(ref: string, sessionId: string | undefined): { ok: true } | { ok: false; why: string } {
+  const verdict = authorised(ref, sessionId)
+  return verdict.ok ? { ok: true } : { ok: false, why: verdict.why }
+}
+
+/** The refusal shape both tools share. */
+function refusal(ref: string, note: string): { status: 'refused'; ref: string; note: string } {
+  return { status: 'refused', ref, note }
+}
+
+function clampTimeout(requested: unknown): number {
+  const value = typeof requested === 'number' && Number.isFinite(requested) ? requested : DEFAULT_TIMEOUT_MS
+  return Math.max(1_000, Math.min(MAX_TIMEOUT_MS, value))
 }
 
 /** What the scene needs from the plugin body (kept explicit so it can be driven without Cordis). */
@@ -258,6 +496,10 @@ interface SceneDeps {
   getCredentials(): CredentialsSeam | undefined
   store: NameStore
   logger: Logger
+  channel?: CardChannel
+  records?: () => RefRecord[]
+  revokeGrant?: (ref: string) => boolean
+  revokeEveryGrant?: () => string[]
 }
 
 /**
@@ -265,7 +507,7 @@ interface SceneDeps {
  * (scripts/verify.mjs). React arrives through the scene props — the host React is a hard
  * contract — so nothing here imports a React of its own.
  */
-function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent {
+function makeScene({ getCredentials, store, logger, channel = new RefusingChannel(), records = () => [], revokeGrant = () => false, revokeEveryGrant = () => [] }: SceneDeps): SceneComponent {
   const MASK = '\u2022\u2022\u2022\u2022' // fixed-length placeholder: neither the value nor its length
 
   return function SecretsScene(props: SceneProps): unknown {
@@ -277,29 +519,42 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
     const [cursor, setCursor] = React.useState(0)
     const [nameBuf, setNameBuf] = React.useState('')
     const [notice, setNotice] = React.useState('')
+    const [scope, setScope] = React.useState<Scope>('none')
     const valueRef = React.useRef('') // the value stays out of state: state is visible to debuggers and serializers
     // A ref change does not repaint, and the mask has to follow every keystroke. This
     // counter state forces the repaint; it counts repaints and never holds the value.
     const [, bumpPaint] = React.useState(0)
     const repaint = (): void => bumpPaint((n) => n + 1)
 
+    // A card opened by the agent has to reach us even when the scene is already on screen.
+    React.useEffect(() => channel.subscribe(() => repaint()), [])
+    const request = channel.active()
+
+    // `grant` is what the record says; the list is where the human sees (and revokes) it.
+    const grantLabel = (name: string): string => {
+      const record = records().find((entry) => entry.ref === name)
+      if (!record || record.scope === 'none') return ''
+      if (record.scope === 'until') return ` · agent use until ${record.expiresAt ?? 'expiry'}`
+      return ` · agent use: ${record.scope}`
+    }
+
     const refresh = React.useCallback(() => {
       const credentials = getCredentials()
       const names = store.loadNames()
-      setRows(names.map((n) => ({ name: n, state: 'checking…' })))
+      setRows(names.map((n) => ({ name: n, state: 'checking…', grant: grantLabel(n) })))
       let cancelled = false
       void (async () => {
         const resolved: Row[] = []
         for (const n of names) {
-          if (!credentials) { resolved.push({ name: n, state: 'service unavailable' }); continue }
+          if (!credentials) { resolved.push({ name: n, state: 'service unavailable', grant: grantLabel(n) }); continue }
           try {
             const info = await credentials.describe(n)
             const bits = [info?.configured ? 'configured' : 'not configured']
             if (info?.source) bits.push(String(info.source))
             if (info?.writable === false) bits.push('read-only')
-            resolved.push({ name: n, state: bits.join(' · ') })
+            resolved.push({ name: n, state: bits.join(' · '), grant: grantLabel(n) })
           } catch (error) {
-            resolved.push({ name: n, state: `lookup failed (${failureLabel(error)})` })
+            resolved.push({ name: n, state: `lookup failed (${failureLabel(error)})`, grant: grantLabel(n) })
           }
         }
         if (!cancelled) setRows(resolved)
@@ -326,6 +581,17 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
         if (key?.downArrow) { setCursor((c) => Math.min(Math.max(0, rows.length - 1), c + 1)); return }
         if (input === 'a') { setNameBuf(''); setNotice(''); setMode('name'); return }
         if (input === 'd' && rows[cursor]) { setNotice(''); setMode('confirm'); return }
+        if (input === 'v' && rows[cursor]) {
+          const target = rows[cursor].name
+          setNotice(revokeGrant(target) ? `revoked agent use for ${target}` : `no agent permission on ${target}`)
+          refresh()
+          return
+        }
+        if (input === 'R') {
+          if (records().some((record) => record.scope !== 'none')) { setNotice(''); setMode('revoke-all') }
+          else setNotice('no agent permission is granted')
+          return
+        }
         return
       }
       if (mode === 'name') {
@@ -354,18 +620,68 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
             .then(() => credentials.set(secretName, payload))
             .then(() => {
               store.addName(secretName)
-              logger.info?.(`set ${secretName}`)
+              logger.info(`set ${secretName}`)
               setNotice(`wrote ${secretName} (the value is not kept and not shown)`)
               refresh()
             })
             .catch((error: unknown) => {
-              logger.warn?.(`set ${secretName} failed: ${failureLabel(error)}`)
+              logger.warn(`set ${secretName} failed: ${failureLabel(error)}`)
               setNotice(`write failed (${failureLabel(error)})`)
             })
           return
         }
         if (key?.backspace) { valueRef.current = valueRef.current.slice(0, -1); repaint(); return }
         if (input && !key?.ctrl && !key?.meta) { valueRef.current += input; repaint(); return }
+        return
+      }
+      if (mode === 'request-scope') {
+        const options = offeredScopes(request?.sessionId)
+        if (key?.escape) { channel.settle({ kind: 'cancelled' }); setNotice('request cancelled'); back(); return }
+        if (input === 'r') { channel.settle({ kind: 'refused' }); setNotice('request refused'); back(); return }
+        if (key?.return) { valueRef.current = ''; setMode('request-value'); return }
+        if (key?.upArrow || key?.downArrow) {
+          const index = options.indexOf(scope)
+          const next = key?.upArrow ? (index <= 0 ? options.length - 1 : index - 1) : (index + 1) % options.length
+          setScope(options[next])
+          return
+        }
+        if (input >= '1' && input <= String(options.length)) { setScope(options[Number(input) - 1]); return }
+        return
+      }
+      if (mode === 'request-value') {
+        if (key?.escape) { valueRef.current = ''; setMode('request-scope'); return }
+        if (key?.return) {
+          if (!credentials) { channel.settle({ kind: 'refused' }); setNotice('credentials service unavailable, nothing written'); back(); return }
+          if (valueRef.current.length === 0) { setNotice('empty value, nothing written'); return }
+          const secretName = initialiseName(request?.ref ?? '')
+          const payload = valueRef.current
+          valueRef.current = ''
+          channel.settle({ kind: 'stored', scope })
+          setMode('list')
+          void Promise.resolve()
+            .then(() => credentials.set(secretName, payload))
+            .then(() => { setNotice(`wrote ${secretName} (${SCOPE_LABEL[scope]})`); refresh() })
+            .catch((error: unknown) => {
+              logger.warn(`set ${secretName} failed: ${failureLabel(error)}`)
+              setNotice(`write failed (${failureLabel(error)})`)
+            })
+          return
+        }
+        if (key?.backspace) { valueRef.current = valueRef.current.slice(0, -1); repaint(); return }
+        if (input && !key?.ctrl && !key?.meta) { valueRef.current += input; repaint(); return }
+        return
+      }
+      if (mode === 'revoke-all') {
+        if (key?.escape || input === 'n') { back(); return }
+        if (input === 'y') {
+          const revoked = revokeEveryGrant()
+          for (const entry of revoked) {
+            appendAudit({ event: 'revoked', ref: entry })
+            logger.info(`revoked the agent permission for ${entry}`)
+          }
+          setNotice(revoked.length > 0 ? `revoked ${revoked.length} agent permission(s)` : 'nothing to revoke')
+          back()
+        }
         return
       }
       if (mode === 'confirm') {
@@ -379,12 +695,13 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
             .then(() => credentials.unset(secretName))
             .then(() => {
               store.removeName(secretName)
-              logger.info?.(`unset ${secretName}`)
+              appendAudit({ event: 'deleted', ref: secretName })
+              logger.info(`unset ${secretName}`)
               setNotice(`deleted ${secretName}`)
               refresh()
             })
             .catch((error: unknown) => {
-              logger.warn?.(`unset ${secretName} failed: ${failureLabel(error)}`)
+              logger.warn(`unset ${secretName} failed: ${failureLabel(error)}`)
               setNotice(`delete failed (${failureLabel(error)})`)
             })
         }
@@ -394,22 +711,39 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
     const title = mode === 'list' ? 'Secrets (/secrets)'
       : mode === 'name' ? 'New reference · step 1: name'
         : mode === 'value' ? `New reference · step 2: value (${initialiseName(nameBuf)})`
-          : `Delete ${rows[cursor]?.name ?? ''}?`
+          : mode === 'request-scope' ? `A credential is requested (${request?.ref ?? ''})`
+            : mode === 'request-value' ? `Value for ${request?.ref ?? ''}`
+              : mode === 'revoke-all' ? 'Revoke every agent permission?'
+                : `Delete ${rows[cursor]?.name ?? ''}?`
 
     const body: unknown[] = []
     if (mode === 'list') {
-      body.push(h(Text, { key: 'hint', dimColor: true }, 'a new · d delete · ↑/↓ select · Esc close'))
+      body.push(h(Text, { key: 'hint', dimColor: true }, 'a new · d delete · v revoke agent use · R revoke all · ↑/↓ select · Esc close'))
       if (rows.length === 0) body.push(h(Text, { key: 'empty' }, 'No references yet. Press a to start.'))
       rows.forEach((row, index) => {
         body.push(h(Text, { key: row.name, ...(index === cursor ? { inverse: true } : {}) },
-          `${index === cursor ? '>' : ' '} ${row.name}  ${row.state}`))
+          `${index === cursor ? '>' : ' '} ${row.name}  ${row.state}${row.grant}`))
       })
+      body.push(h(Text, { key: 'note', dimColor: true }, 'Agent use goes through the plugin tools only; another plugin reading the same reference is outside our reach.'))
     } else if (mode === 'name') {
       body.push(h(Text, { key: 'name' }, `Name: ${nameBuf || '(uppercase letters, digits, underscore)'}`))
       body.push(h(Text, { key: 'key', dimColor: true }, 'Enter next · Esc back'))
     } else if (mode === 'value') {
       body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
       body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter writes · Esc discards'))
+    } else if (mode === 'request-scope') {
+      body.push(h(Text, { key: 'purpose' }, `Purpose: ${request?.purpose ?? ''}`))
+      const options = offeredScopes(request?.sessionId)
+      options.forEach((option, index) => {
+        body.push(h(Text, { key: option, ...(option === scope ? { inverse: true } : {}) },
+          `${option === scope ? '>' : ' '} ${index + 1}. ${SCOPE_LABEL[option]}`))
+      })
+      body.push(h(Text, { key: 'key', dimColor: true }, '1-4 / ↑↓ choose · Enter next · r refuse · Esc cancel'))
+    } else if (mode === 'request-value') {
+      body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
+      body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter stores · Esc back'))
+    } else if (mode === 'revoke-all') {
+      body.push(h(Text, { key: 'warn' }, 'Every agent permission becomes "not allowed"; the stored values stay. y confirms · n/Esc cancels'))
     } else {
       body.push(h(Text, { key: 'warn' }, 'This removes the name from the DSH credential store. y confirms · n/Esc cancels'))
     }
@@ -426,4 +760,4 @@ function makeScene({ getCredentials, store, logger }: SceneDeps): SceneComponent
  * For tests: the same construction as apply, without Cordis.
  * @internal
  */
-export const __internals = { makeScene, SCENE_ID, DEFAULTS }
+export const __internals = { makeScene, SCENE_ID, DEFAULTS, REQUEST_TOOL, USE_TOOL }
