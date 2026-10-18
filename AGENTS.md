@@ -37,7 +37,7 @@ dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ```sh
 pnpm install    # 首次：装构建依赖（typescript / @types/node / @deepseek-ai/cordis）
 npm run compile # = 清 lib/ 再 tsc -p tsconfig.json：src/ → lib/types/
-npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㉟ 工具与权限表 + ⑳ 声明闸门，30/30 PASS 为通过
+npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㊳ 工具与权限表 + ⑳ 声明闸门，33/33 PASS 为通过
 npm run verify  # 同一入口
 npm run typecheck   # tsc --noEmit，静态关口
 npm pack --dry-run          # 检查发布内容（17 文件；npm 缓存不在工作区时加 npm_config_cache=<目录>）

@@ -762,6 +762,9 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
     } else if (mode === 'value') {
       body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
       body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter writes · Esc discards'))
+      // Always shown, never conditional: a hint that appeared only for short values would leak the
+      // length the mask exists to hide.
+      body.push(h(Text, { key: 'short', dimColor: true }, 'a very short value replaces every match of it in later command output'))
     } else if (mode === 'request-scope') {
       body.push(h(Text, { key: 'purpose' }, `Purpose: ${request?.purpose ?? ''}`))
       const options = offeredScopes(request?.sessionId)
@@ -773,6 +776,7 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
     } else if (mode === 'request-value') {
       body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
       body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter stores · Esc back'))
+      body.push(h(Text, { key: 'short', dimColor: true }, 'a very short value replaces every match of it in later command output'))
     } else if (mode === 'revoke-all') {
       body.push(h(Text, { key: 'warn' }, 'Every agent permission becomes "not allowed"; the stored values stay. y confirms · n/Esc cancels'))
     } else {

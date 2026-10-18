@@ -474,7 +474,7 @@ await check('⑫ real host render (real React + real ink): the mask repaints and
 // wants a string), so the quoting is our attack surface. It is proved against a real /bin/sh
 // rather than by reading the code: whatever the model sends stays data, and only a script the
 // model writes itself — `['sh','-c','…']` — is expanded, by that inner shell.
-const { quoteArg, toCommand, runWithCredential, injectedName } = await import('../lib/types/use.js')
+const { quoteArg, toCommand, runWithCredential, injectedName, redact } = await import('../lib/types/use.js')
 
 /** A stand-in for ctx.shell that really runs the command string through /bin/sh. */
 function shellStub() {
@@ -848,6 +848,49 @@ await check('㉟ the card: the agent asks, the human picks a scope, the value is
   assert(settled.length === 1 && settled[0].kind === 'stored' && settled[0].scope === 'once', `the card settled wrong: ${JSON.stringify(settled)}`)
   assert(!JSON.stringify(settled).includes(SENTINEL), 'the settled outcome carries the value')
   assert(view.frames.every((frame) => !frame.includes(SENTINEL)), 'a rendered frame holds the value')
+})
+
+await check('㊱ a transformed value is not caught: redacted false does not mean "no value"', async () => {
+  freshTuiHome('base64')
+  const value = 'TRANSFORM_SENTINEL_31af'
+  const encoded = Buffer.from(`tok=${value}\n`, 'utf8').toString('base64')
+  // The same command the model would write with `| base64`: the value leaves as a transformed copy.
+  const host = toolHost({ value, run: () => ({ exitCode: 0, stdout: `${encoded}\n`, stderr: '', timedOut: false, aborted: false }) })
+  store.markStored('ALPHA_TOKEN', { scope: 'once' })
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  const result = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['sh', '-c', 'printf %s "$DSH_SECRET_ALPHA_TOKEN" | base64'] }, {})
+  assert(result.redacted === false, 'a transformed copy must not be reported as redacted')
+  assert(result.stdout.includes(encoded), 'the encoded value is what the model gets back')
+  assert(!result.stdout.includes(value), 'the plain value must not be in the output here')
+  assert(!result.stdout.includes('[credential]'), 'nothing was replaced')
+})
+
+await check('㊲ a truncated value passes through too: redacted false is not proof', async () => {
+  freshTuiHome('truncated')
+  const value = 'TRUNC_SENTINEL_77c1'
+  const half = value.slice(0, 6)
+  // What the executor's capture cap does to the output: the value is cut in the middle.
+  const host = toolHost({ value, run: () => ({ exitCode: 0, stdout: `tok=${half}`, stderr: '', timedOut: false, aborted: false }) })
+  store.markStored('ALPHA_TOKEN', { scope: 'once' })
+  apply(host.ctx)
+  const use = toolNamed(host.registered, 'use_credential')
+  const result = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['sh', '-c', 'printf %s "$DSH_SECRET_ALPHA_TOKEN"'] }, {})
+  assert(result.redacted === false, 'a half value must not be reported as redacted')
+  assert(result.stdout === `tok=${half}`, `the truncated output was altered: ${JSON.stringify(result.stdout)}`)
+  // The guarantee is the wording, not the mechanism: nothing in our own result carries the value.
+  assert(!JSON.stringify({ ...result, stdout: '', stderr: '' }).includes(value), 'the value leaked outside stdout')
+})
+
+await check('㊳ redaction replaces every occurrence — short values make output unreadable, and that is deliberate', async () => {
+  // Replacing every occurrence is the safe side: replacing only the first would leak the rest.
+  // The cost is real and pinned here so nobody "fixes" it into a leak later.
+  assert(redact('exit1 code 1 FAILED', '1').text === 'exit[credential] code [credential] FAILED', 'the short-value cost changed')
+  assert(redact('token=abc123', 'abc123').text === 'token=[credential]', 'the ordinary case changed')
+  // Single pass (split/join), so a value that happens to be the placeholder itself is NOT
+  // re-substituted — unlike a loop-based scrubber, which yields `[[credential]]`.
+  assert(redact('the value is credential', 'credential').text === 'the value is [credential]', 'the single-pass placeholder case changed')
+  assert(redact('nothing here', 'abc123').text === 'nothing here', 'a miss must not touch the text')
 })
 
 // ---------------------------------------------------------------- the declaration gate

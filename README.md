@@ -151,6 +151,11 @@ the plugin-private directory above.
   `credentials.resolve(ref)` with the same name reads the value directly — we do not pretend
   otherwise. The guarantee is narrower and true: every path the **agent** takes goes through
   these two tools.
+- **A short value can make output unreadable**: redaction replaces **every** occurrence (the safe
+  choice — replacing only the first would leak the rest) and the scene accepts two-character values,
+  so a short one rewrites every matching substring in a command's output. The replacement is a single
+  pass, so a value that happens to be `credential` does not get substituted twice. The card carries a
+  standing note about this (made conditional, it would leak the value's length).
 - **`session` permissions never expire on their own**: resuming a session creates a new agent
   with the same session id, so nothing can tell "this session is gone for good". Revoke them
   yourself (`v`, `R`), or delete the reference. Only `once` and `until` clear themselves.
@@ -170,7 +175,7 @@ the host loads and what the npm package ships. `lib/` is generated and is not in
 
 The script covers three layers plus one gate: `①–⑫` the scene (sentinel checks, including a
 real ink render), `⑬–⑮` the quoting of the model's `argv` against a real `/bin/sh`, the tools
-and the permission table (`㉑–㉟`: registration, refusals, scopes, audit, revoke, degradation,
+and the permission table (`㉑–㊳`: registration, refusals, scopes, audit, redaction's honest edges, revoke, degradation,
 the card round-trip), and `⑳` the plugin declaration through the host's own
 `@dsh-std/manifest` parser and the TUI profile validator.
 
