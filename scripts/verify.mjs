@@ -1,4 +1,6 @@
-// 哨兵验证：证明「值只进 ctx.credentials，别的面一个字节都看不到」。
+// 验收脚本：两层证据。
+//   ① 场景侧哨兵验证：证明「值只进 ctx.credentials，别的面一个字节都看不到」。
+//   ② bin 侧写盘验证：证明它和 provider 共用一把锁、只做行级 upsert、缺前提一律 fail-closed。
 //
 // 做法不是读源码找茬，而是**真的把场景跑起来**：这里实现一份最小 React hook runtime
 // 与 ui kit 替身，按真人按键顺序驱动场景（a → 名字 → Enter → 值 → Enter），
@@ -15,10 +17,11 @@
 //   - 不能替代真机 TTY 手测：真终端里的回滚缓冲、终端录像、宿主自身日志不在这里。
 //   - 不覆盖终端之外的写入方（Web 卡片、dsh CLI 自己写同一份凭据文件）。
 //
-// 用法：node scripts/verify-redaction.mjs   （npm test / npm run verify 同一入口）
+// 用法：node scripts/verify.mjs   （npm test / npm run verify 同一入口）
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 // 名字清单落在隔离目录，绝不碰用户真实的 ~/.dsh-tui。
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tui-secret-verify-'))
@@ -452,6 +455,189 @@ await check('⑫ 真宿主渲染（真实 React + 真实 ink）：掩码随输�
   } finally {
     instance.unmount()
   }
+})
+
+// ---------------------------------------------------------------- bin（同一份代码的另一半）
+const CLI_PATH = new URL('../bin/dsh-tui-secret.mjs', import.meta.url).pathname
+
+function cliRun(args, { home, tui, input }) {
+  const env = { ...process.env, DSH_HOME: home, DSH_TUI_HOME: tui }
+  delete env.DSH_TUI_PROFILE
+  return spawnSync(process.execPath, [CLI_PATH, ...args], { input, encoding: 'utf8', env })
+}
+
+function freshHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tui-secret-cli-'))
+  const tui = path.join(home, 'tui-home')
+  fs.mkdirSync(tui, { recursive: true })
+  return { home, tui, file: path.join(home, '.credentials.yaml') }
+}
+
+function seedCredentials(file, text) {
+  fs.writeFileSync(file, text, { mode: 0o600 })
+  fs.chmodSync(file, 0o600)
+}
+
+/** 用宿主装的 yaml 包解析，证明 provider 读回来的值就是我们写进去的那个。 */
+async function parseWithHostYaml(text) {
+  const candidates = [
+    path.join(os.homedir(), '.dsh/profiles/dsh-tui/node_modules/yaml/dist/index.js'),
+    path.join(os.homedir(), '.bun/install/global/node_modules/yaml/dist/index.js'),
+  ]
+  const found = candidates.find((candidate) => fs.existsSync(candidate))
+  if (!found) return undefined
+  const { pathToFileURL } = await import('node:url')
+  const { parse } = await import(pathToFileURL(found).href)
+  return parse(text)
+}
+
+const CLI_SECRET = 'CLI_SENTINEL_do_not_leak_91bd'
+
+await check('⑬ bin set：行级 upsert —— 注释、别人的键、块标量都原样留着', async () => {
+  const { home, tui, file } = freshHome()
+  const original = '# 保留注释\nALPHA: a\nPEM: |\n  line1\n  line2\n'
+  seedCredentials(file, original)
+
+  const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
+  assert(result.status === 0, `set 退出码 ${result.status}：${result.stderr}`)
+  assert(!result.stdout.includes(CLI_SECRET) && !result.stderr.includes(CLI_SECRET), 'stdout/stderr 里出现了值')
+
+  const after = fs.readFileSync(file, 'utf8')
+  assert(after.includes('# 保留注释'), '注释被吃掉了')
+  assert(after.includes('ALPHA: a'), '别的键被改写了')
+  assert(after.includes('PEM: |\n  line1\n  line2\n'), '块标量被改写')
+  assert(after.trimEnd().endsWith(`BETA: "${CLI_SECRET}"`), `新键没追加：${JSON.stringify(after)}`)
+  assert((fs.statSync(file).mode & 0o777) === 0o600, `权限不是 600：${(fs.statSync(file).mode & 0o777).toString(8)}`)
+  assert(!fs.existsSync(`${file}.lock`), '锁文件没清掉')
+  assert(fs.readdirSync(home).every((name) => !name.endsWith('.tmp')), '留了临时文件')
+
+  const parsed = await parseWithHostYaml(after)
+  if (parsed === undefined) throw new Skip('没有可用的 yaml 包，跳过「provider 读回来一致」这一半')
+  assert(parsed.BETA === CLI_SECRET, 'provider 解析出来的值不是我们写进去的')
+  assert(parsed.ALPHA === 'a' && parsed.PEM === 'line1\nline2\n', '别人的键解析结果变了')
+})
+
+await check('⑭ bin set 覆盖同一个键：只换那一行，其余字节不变', async () => {
+  const { home, tui, file } = freshHome()
+  const original = '# c\nALPHA: a\nPEM: |\n  line1\n  line2\n'
+  seedCredentials(file, original)
+  assert(cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: 'first' }).status === 0, '第一次写失败')
+  const once = fs.readFileSync(file, 'utf8')
+  assert(cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: 'second' }).status === 0, '第二次写失败')
+  const twice = fs.readFileSync(file, 'utf8')
+  assert(once.split('\n').length === twice.split('\n').length, '覆盖写改变了行数（可能整份重写了）')
+  assert(twice.includes('# c') && twice.includes('PEM: |\n  line1\n  line2\n'), '覆盖写动了别的键')
+  assert(twice.includes('ALPHA: "second"'), `覆盖没生效：${JSON.stringify(twice)}`)
+  assert(!twice.includes('first'), '旧值还在文件里')
+})
+
+await check('⑮ bin 与 provider 是同一把锁：占着锁就报错退出、不写', async () => {
+  const { home, tui, file } = freshHome()
+  seedCredentials(file, 'ALPHA: a\n')
+  const lockPath = `${file}.lock`
+  fs.writeFileSync(lockPath, '12345\n', { mode: 0o600, flag: 'wx' })
+  try {
+    const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
+    assert(result.status === 2, `占锁时退出码应为 2，实际 ${result.status}`)
+    assert(result.stderr.includes('写锁'), `报错没说清是锁：${result.stderr}`)
+    assert(result.stderr.includes(lockPath), `报错没给锁路径：${result.stderr}`)
+    assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', '占锁时文件被改了')
+  } finally {
+    fs.rmSync(lockPath, { force: true })
+  }
+
+  // 用 provider 自己那把 withFileLock 再撞一次（装了才跑）
+  const atomicEntry = [
+    path.join(os.homedir(), '.bun/install/global/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js'),
+    path.join(os.homedir(), '.dsh/profiles/dsh-tui/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js'),
+  ].find((candidate) => fs.existsSync(candidate))
+  if (atomicEntry === undefined) throw new Skip('没有 dsh-atomic-write，跳过「与真锁对撞」这一半')
+  const { pathToFileURL } = await import('node:url')
+  const { withFileLock } = await import(pathToFileURL(atomicEntry).href)
+  await withFileLock(file, async () => {
+    const result = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
+    assert(result.status === 2, `provider 占锁时退出码应为 2，实际 ${result.status}`)
+    assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'provider 占锁时文件被改了')
+  })
+})
+
+await check('⑯ bin fail-closed：不给来源 / 空值 / 保留前缀 / 被环境遮蔽 / 权限过宽，一律拒且不写', async () => {
+  const { home, tui, file } = freshHome()
+  seedCredentials(file, 'ALPHA: a\n')
+  const before = fs.readFileSync(file, 'utf8')
+
+  const noSource = cliRun(['set', 'BETA'], { home, tui, input: '' })
+  assert(noSource.status === 2 && noSource.stderr.includes('--from-stdin'), `非 TTY 不给来源应拒绝：${noSource.status} ${noSource.stderr}`)
+  assert(!noSource.stdout.includes('已写入'), '拒绝路径却报了成功')
+
+  const empty = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: '' })
+  assert(empty.status === 2 && empty.stderr.includes('空值'), `空值应拒绝：${empty.stderr}`)
+
+  const reserved = cliRun(['set', 'DSH_SOMETHING', '--from-stdin'], { home, tui, input: CLI_SECRET })
+  assert(reserved.status === 2 && reserved.stderr.includes('宿主'), `DSH_ 前缀应拒绝：${reserved.stderr}`)
+
+  const shadowed = cliRun(['set', 'ALPHA', '--from-stdin'], { home, tui, input: CLI_SECRET })
+  assert(shadowed.status === 0, '没有遮蔽时正常写应当成功')
+  seedCredentials(file, before)
+  const envHome = { ...process.env, DSH_HOME: home, DSH_TUI_HOME: tui, SHADOW_ME: 'x' }
+  const shadowRun = spawnSync(process.execPath, [CLI_PATH, 'set', 'SHADOW_ME', '--from-stdin'], { input: CLI_SECRET, encoding: 'utf8', env: envHome })
+  assert(shadowRun.status === 2 && shadowRun.stderr.includes('遮蔽'), `环境遮蔽应拒绝：${shadowRun.status} ${shadowRun.stderr}`)
+
+  fs.chmodSync(file, 0o644)
+  const wide = cliRun(['set', 'BETA', '--from-stdin'], { home, tui, input: CLI_SECRET })
+  assert(wide.status === 2 && wide.stderr.includes('chmod 600'), `权限过宽应拒绝：${wide.stderr}`)
+  fs.chmodSync(file, 0o600)
+
+  assert(fs.readFileSync(file, 'utf8') === before, 'fail-closed 路径里有一次真写盘')
+})
+
+await check('⑰ bin rm：缺 --yes 拒绝；给了只摘那一个键', async () => {
+  const { home, tui, file } = freshHome()
+  seedCredentials(file, '# c\nALPHA: a\nBETA: b\n')
+  const refused = cliRun(['rm', 'BETA'], { home, tui })
+  assert(refused.status === 2, `缺 --yes 应拒绝：${refused.status}`)
+  assert(fs.readFileSync(file, 'utf8').includes('BETA: b'), '缺 --yes 却删了')
+
+  const ok = cliRun(['rm', 'BETA', '--yes'], { home, tui })
+  assert(ok.status === 0, `rm 失败：${ok.stderr}`)
+  const after = fs.readFileSync(file, 'utf8')
+  assert(!after.includes('BETA'), '键没删掉')
+  assert(after.includes('# c') && after.includes('ALPHA: a'), '删一个键动了别的行')
+
+  // 删到只剩注释：注释不丢（我们只摘键的 span）；键全没了但还有别的行时不会写成 {}
+  assert(cliRun(['rm', 'ALPHA', '--yes'], { home, tui }).status === 0, '删第二个失败')
+  assert(fs.readFileSync(file, 'utf8') === '# c\n', `只剩注释时应保留注释：${JSON.stringify(fs.readFileSync(file, 'utf8'))}`)
+
+  // 没有注释时：删空与 provider 一样落 {}
+  const bare = freshHome()
+  seedCredentials(bare.file, 'ALPHA: a\n')
+  assert(cliRun(['rm', 'ALPHA', '--yes'], { home: bare.home, tui: bare.tui }).status === 0, '删空失败')
+  assert(fs.readFileSync(bare.file, 'utf8') === '{}\n', `删空后应为 {}：${JSON.stringify(fs.readFileSync(bare.file, 'utf8'))}`)
+})
+
+await check('⑱ bin list：只出名字与状态，任何输出里都没有值', async () => {
+  const { home, tui, file } = freshHome()
+  seedCredentials(file, `ALPHA: "${CLI_SECRET}"\n`)
+  const plain = cliRun(['list'], { home, tui })
+  assert(plain.status === 0, `list 失败：${plain.stderr}`)
+  assert(plain.stdout.includes('ALPHA'), 'list 没列出键')
+  assert(!plain.stdout.includes(CLI_SECRET), 'list 里出现了值')
+  const json = cliRun(['list', '--json'], { home, tui })
+  assert(json.status === 0, `list --json 失败：${json.stderr}`)
+  assert(!json.stdout.includes(CLI_SECRET), 'json 输出里出现了值')
+  const parsedJson = JSON.parse(json.stdout)
+  assert(parsedJson[0]?.name === 'ALPHA' && parsedJson[0]?.state === '已配置', `json 形状不对：${json.stdout}`)
+})
+
+await check('⑲ bin set --dry-run：不落盘、不建锁', async () => {
+  const { home, tui, file } = freshHome()
+  seedCredentials(file, 'ALPHA: a\n')
+  const result = cliRun(['set', 'BETA', '--from-stdin', '--dry-run'], { home, tui, input: CLI_SECRET })
+  assert(result.status === 0, `dry-run 失败：${result.stderr}`)
+  assert(result.stdout.includes('[dry-run]'), 'dry-run 没标出来')
+  assert(!result.stdout.includes(CLI_SECRET), 'dry-run 打印了值')
+  assert(fs.readFileSync(file, 'utf8') === 'ALPHA: a\n', 'dry-run 竟然写了盘')
+  assert(!fs.existsSync(`${file}.lock`), 'dry-run 建了锁')
 })
 
 // ---------------------------------------------------------------- 汇总
