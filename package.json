@@ -4,7 +4,7 @@
   "description": "Secure secret entry for dsh-TUI: a /secrets scene that writes through the DSH credentials seam.",
   "author": "zerodegress <zerodegress@outlook.com>",
   "type": "module",
-  "packageManager": "pnpm@11.21.0",
+  "packageManager": "pnpm@12.11.2",
   "main": "lib/types/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
