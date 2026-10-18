@@ -138,7 +138,9 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 npm test        # = node scripts/verify.mjs
 ```
 
-脚本覆盖两半：`①–⑫` 是场景（哨兵验证），`⑬–⑲` 是命令行（写盘协议与 fail-closed）。
+脚本覆盖两半加一道闸门：`①–⑫` 是场景（哨兵验证），`⑬–⑲` 是命令行（写盘协议与
+fail-closed），`⑳` 是插件声明 —— 用宿主自己的 `@dsh-std/manifest` 解析器与 TUI profile 校验器
+离线跑一遍，manifest 一漂当场就红。
 
 - **场景那半**实现一份最小 React hook runtime 与 ui kit 替身，**把场景真正跑起来**，按
   真人按键顺序驱动（`a` → 名字 → `Enter` → 值 → `Enter`），把每一帧渲染字符串、每一条
@@ -147,7 +149,7 @@ npm test        # = node scripts/verify.mjs
 - **命令行那半**用子进程跑真实入口，并调用宿主的 `yaml` 包把文件解析回来比对值、
   用 provider 真正的 `withFileLock` 占锁对撞。
 
-当前 `20/20 PASS`：
+当前 `21/21 PASS`：
 
 ```
 PASS  ① an empty value is refused: Enter writes nothing
@@ -170,6 +172,7 @@ PASS  ⑯ cli fail-closed: no source / empty value / reserved prefix / shadowed 
 PASS  ⑰ cli rm: refused without --yes; with it, only that key goes
 PASS  ⑱ cli list: names and state only, no value anywhere in the output
 PASS  ⑲ cli set --dry-run: no write, no lock
+PASS  ⑳ the declaration passes the upstream parser and the TUI profile gate
 ```
 
 其中 `⑫` 依赖本机装有 dsh-TUI profile，未安装时 `SKIP`（可用 `DSH_TUI_PROFILE=` 指定
