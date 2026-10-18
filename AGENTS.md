@@ -61,6 +61,10 @@ provider 真 `withFileLock` 占锁）在缺件时打印 `SKIP`，`SKIP` 不算�
 - **脱敏**：仓库内容不得出现私用域名、本机绝对路径、凭据或其片段。
 - **Git 安全**：只暂存显式路径，不用 `git add .`/`git add -A`；未经要求不 commit、不打 tag、
   不 push。推送权归维护者。
+- **`dsh-plugin.json` 必须能过上游 parser**：community v0.15 的 schema 顶层
+  `additionalProperties: false`，未知字段直接拒绝（`description` 就不合法，得写成 `x-description`），
+  且 `subscriptions` 是必填。改完拿宿主那份 `@dsh-std/manifest` 真跑一遍
+  （`parseManifest` + `projectManifest`），别凭印象。
 - 改动场景或命令行语义时，同步更新 `scripts/verify.mjs`（它是这两个面的唯一回归网）与
   两份 README 的验证段。
 
