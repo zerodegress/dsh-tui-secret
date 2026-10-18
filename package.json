@@ -1,7 +1,7 @@
 {
   "name": "dsh-tui-secret",
   "version": "0.1.0",
-  "description": "Secure secret entry for dsh-TUI: a /secrets scene that writes through the dsh credentials seam",
+  "description": "Secure secret entry for dsh-TUI: a /secrets scene that writes through the DSH credentials seam.",
   "author": "zerodegress <zerodegress@outlook.com>",
   "type": "module",
   "main": "lib/types/index.js",

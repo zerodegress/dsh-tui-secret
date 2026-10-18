@@ -18,7 +18,6 @@
 > 的存储，而是与凭据 provider **共用同一把写锁与同一套原子写**。
 
 ## 功能亮点
-
 - **场景内掩码录入** — `/secrets` 打开一个全屏场景：按 `a` 新建引用，逐字掩码输入，`Enter` 写入。
 - **固定长度掩码** — 不论多长都是 `••••`：屏幕上既没有字符，也看不出长度。
 - **只有一条值通路** — 值只到 `ctx.credentials`：不注册工具、不挂 `tools/execute` 与
@@ -30,11 +29,11 @@
 - **声明有闸门** — `npm test` 会把 `dsh-plugin.json` 送进宿主自己的解析器与 TUI profile
   校验器，manifest 一漂本地就红。
 
-用法：[场景用法](#用法场景) · [命令行](#命令行)。设计说明：[文档索引](docs/README.md)。
 
-## 安装
+## 快速开始
+支持目标：**`@deepseek-harness-tui/dsh-tui`** 0.16.x —— 其他 TUI 实现不在目标内。
 
-```bash
+```sh
 dsh plugin --profile dsh-tui add dsh-tui-secret
 ```
 
@@ -51,25 +50,8 @@ dsh plugin --profile dsh-tui add dsh-tui-secret
 
 装完重启 TUI，输入 `/secrets`。
 
-## 用法（场景）
-
-界面文案为英文（与上游默认一致），下方键位与说明为中文。
-
-| 键 | 作用 |
-| --- | --- |
-| `a` | 新建引用：先输名字，再输值 |
-| `d` | 删除光标所在的引用（再按 `y` 确认） |
-| `↑` `↓` | 移动选择 |
-| `Enter` | 下一步 / 写入 |
-| `Esc` | 返回上一层；列表里按 `Esc`（或 `q`）关屏 |
-
-名字规则与 DSH 一致：大写字母开头，只含 `A-Z 0-9 _`，≤64 字符；`DEEPSEEK_` / `DSH_`
-开头归宿主所有，插件当场拒绝并说明理由（dsh-TUI 的 `credentialRefGuard` 在这些前缀上
-本来也会剔掉插件自己的 ref，这里提前给出可读的理由，而不是等宿主静默丢弃）。
-
-## 命令行
-
-```bash
+### 命令行
+```sh
 dsh-tui-secret list [--json]                 # 只列名字与状态，永不列值
 dsh-tui-secret set NAME --from-stdin         # 从标准输入读值
 dsh-tui-secret set NAME --from-file ./k.txt  # 从文件读值
@@ -101,8 +83,22 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 场景中登记过的名字。场景那半列的是名字清单，不读凭据文件——provider 未必是文件实现，
 插件不应该假定它存在哪里。
 
-## 值如何不被泄漏
+## 快捷键
+界面文案为英文（与上游默认一致），下方键位与说明为中文。
 
+| 键 | 作用 |
+| --- | --- |
+| `a` | 新建引用：先输名字，再输值 |
+| `d` | 删除光标所在的引用（再按 `y` 确认） |
+| `↑` `↓` | 移动选择 |
+| `Enter` | 下一步 / 写入 |
+| `Esc` | 返回上一层；列表里按 `Esc`（或 `q`）关屏 |
+
+名字规则与 DSH 一致：大写字母开头，只含 `A-Z 0-9 _`，≤64 字符；`DEEPSEEK_` / `DSH_`
+开头归宿主所有，插件当场拒绝并说明理由（dsh-TUI 的 `credentialRefGuard` 在这些前缀上
+本来也会剔掉插件自己的 ref，这里提前给出可读的理由，而不是等宿主静默丢弃）。
+
+## 工作原理
 - **值只走 `ctx.credentials.set(ref, value)`**：不另开文件、不写 `.credentials.yaml`
   本体、不复制值到别处。空值被拒（DSH 语义里空值等于未配置）。
 - **值不进 React state**：存 `useRef`，提交前先在本地丢弃，失败也不留在 state 里。
@@ -116,10 +112,11 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 - **列表只出「是否已配置 / 来源 / 可写性」**：来自 `credentials.describe()`，它按设计
   就不返回值。
 
-这些断言不是靠读源码得出的：`npm test` 会把场景真正跑起来逐帧检查，详见「验证」。
+这些断言不是靠读源码得出的：`npm test` 会把场景真正跑起来逐帧检查，详见「开发」。
 
+- **接缝** —— `ctx.tuiScenes`（全屏场景）、`ctx.commands`（命令）、`ctx.credentials`
+  （DSH 核心凭据服务）。场景面缺失时静默降级为「什么都没发生」，绝不拖垮 TUI 启动。
 ## 存储
-
 | 内容 | 位置 | 权限 |
 | --- | --- | --- |
 | 值（由 DSH 管） | `<DSH_HOME>/.credentials.yaml` | provider 保证 0600 |
@@ -135,8 +132,7 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 默认**拒绝**、要写 `~/.dsh-tui/extension-grants.json` 才通。v1 选择零授权，因此先落在
 上面那个插件私有目录。
 
-## 边界
-
+## 已知限制
 - **命令行不是第二套存储**：它写的就是 provider 那个文件、用 provider 那把锁。它**没有**
   provider 的语义完整性——例如 provider 会拒绝「被环境遮蔽」的写入，命令行只能按自己
   进程的环境判断，会话从别的 shell 启动时判据可能不同。
@@ -147,9 +143,8 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 - **不向上游提交补丁**：dsh-TUI 的设置区块已经声明了 `secret: { ref }` 字段，等它的
   设置屏自己把掩码渲染补上，这个场景可以退化成纯列表管理。
 
-## 验证
-
-```bash
+## 开发
+```sh
 npm test        # = node scripts/verify.mjs
 ```
 
@@ -164,28 +159,11 @@ fail-closed），`⑳` 是插件声明 —— 用宿主自己的 `@dsh-std/manif
 - **命令行那半**用子进程跑真实入口，并调用宿主的 `yaml` 包把文件解析回来比对值、
   用 provider 真正的 `withFileLock` 占锁对撞。
 
-## 兼容性
+工具链：Node `^22.19 || >=24`，ESM，无运行时依赖；`@deepseek-ai/cordis` 是可选 peer。
+未决的契约项集中记在 [docs/plugin-design.md](docs/plugin-design.md)。
 
-- 只支持 **`@deepseek-harness-tui/dsh-tui`**（0.16.x 实读；其他 TUI 实现不在目标内）。
-- Node `^22.19 || >=24`；ESM；无运行时依赖，`@deepseek-ai/cordis` 是可选 peer。
-- 接缝：`ctx.tuiScenes`（全屏场景）、`ctx.commands`（命令）、`ctx.credentials`
-  （DSH 核心凭据服务）。场景面缺失时静默降级为「什么都没发生」，绝不拖垮 TUI 启动。
-
-## 待确认的契约项
-
-1. **`Config` 没有导出**：插件指南写的三个面是 `name` / `Config` / `apply`；本包唯一的
-   配置键 `entryCommand` 在 `apply` 内用 `?? DEFAULTS` 兜底，没有导出 Schemastery 的
-   `Config`。若 profile 的 manifest 校验要求它存在，补一个 `@deepseek-ai/schemastery` 的
-   `Schema.object({...}).default(...)` 即可。
-2. **命令的注册路径**：默认走 plugin-host 托管面
-   `ctx.tuiPluginHost.registerCommand(ctx, definition)`，命令因此带上本插件的 verified
-   归属（宿主 `commands.invoke` 的 denies 才能对它生效）；托管面缺失或注册被拒时退回
-   `ctx.commands.register` 直接注册（同进程信任边界）。`dsh-plugin.json` 里的贡献 id 是
-   `dsh-tui-secret.open`，与注册的命令名 `secrets` 不必同名——贡献 id 是声明身份，
-   不是命令名。
-
-设计说明见 [docs/plugin-design.md](docs/plugin-design.md)。
-
-## 许可
-
+## 文档
+- **设计** —— [plugin-design.md](docs/plugin-design.md) · [文档索引](docs/README.md)
+  · [dsh-TUI 插件指南](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/tui-profile/docs/plugin-admission-and-development.md)
+## License
 [MIT](LICENSE)

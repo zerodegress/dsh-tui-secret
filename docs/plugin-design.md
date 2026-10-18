@@ -1,6 +1,6 @@
 # 插件设计
 
-[文档索引](README.md) · [项目首页](../README_ZH.md) · [English](README.md)
+[文档索引](README.md) · [项目首页](../README_ZH.md)
 
 本插件把 DSH 已经具备的凭据接缝接到 dsh-TUI 的界面上：密钥由**用户**自己在终端里
 输入，值只经凭据服务写入，插件本体不回显、不记日志、不进会话。本文记录设计依据、
@@ -106,7 +106,7 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 会话遥测（若有）属于另一条链路（`dsh-session-telemetry` 的 `session-telemetry/record`
 waterfall），本插件不写遥测，因此不需要在那里挂脱敏规则。
 
-## 可验证性
+## 验证
 
 `npm test` 跑 `scripts/verify.mjs`，两层证据：
 

@@ -20,7 +20,6 @@
 > protocol.
 
 ## Highlights
-
 - **Masked entry inside the scene** — `/secrets` opens a full-screen scene: `a` starts a
   reference, the value is typed with per-keystroke masking, `Enter` writes it.
 - **A fixed-length mask** — `••••` whatever the length: the screen shows neither the
@@ -34,11 +33,12 @@
 - **The declaration is gated** — `npm test` runs `dsh-plugin.json` through the host's own
   parser and the TUI profile validator, so a drifted manifest fails locally.
 
-Usage: [Scene usage](#scene-usage) · [CLI](#cli). Design: [documentation index](docs/README.md).
 
-## Install
+## Quick Start
+Supported target: **`@deepseek-harness-tui/dsh-tui`** 0.16.x — other TUI implementations
+are out of scope.
 
-```bash
+```sh
 dsh plugin --profile dsh-tui add dsh-tui-secret
 ```
 
@@ -55,24 +55,8 @@ Or add one row to the profile's `cordis.patch.yml` (this package's own
 
 Restart the TUI and type `/secrets`.
 
-## Scene usage
-
-| Key | Action |
-| --- | --- |
-| `a` | New reference: name first, then value |
-| `d` | Delete the selected reference (`y` confirms) |
-| `↑` `↓` | Move the selection |
-| `Enter` | Next step / write |
-| `Esc` | Back one step; on the list, `Esc` (or `q`) closes the scene |
-
-Names follow DSH rules: start with an uppercase letter, `A-Z 0-9 _` only, at most 64
-characters. `DEEPSEEK_` / `DSH_` prefixes belong to the host — the plugin refuses them on
-the spot with a readable reason, instead of letting dsh-TUI's `credentialRefGuard`
-silently drop the ref later.
-
-## CLI
-
-```bash
+### CLI
+```sh
 dsh-tui-secret list [--json]                 # names and state only, never values
 dsh-tui-secret set NAME --from-stdin         # read the value from stdin
 dsh-tui-secret set NAME --from-file ./k.txt  # read the value from a file
@@ -110,8 +94,21 @@ a deployment that turns the watcher off sees a new value on its next read.
 scene lists its own name index and never reads the credential document — the provider
 need not be file-backed, and the plugin should not assume where it lives.
 
-## How a value stays out of sight
+## Keybindings
+| Key | Action |
+| --- | --- |
+| `a` | New reference: name first, then value |
+| `d` | Delete the selected reference (`y` confirms) |
+| `↑` `↓` | Move the selection |
+| `Enter` | Next step / write |
+| `Esc` | Back one step; on the list, `Esc` (or `q`) closes the scene |
 
+Names follow DSH rules: start with an uppercase letter, `A-Z 0-9 _` only, at most 64
+characters. `DEEPSEEK_` / `DSH_` prefixes belong to the host — the plugin refuses them on
+the spot with a readable reason, instead of letting dsh-TUI's `credentialRefGuard`
+silently drop the ref later.
+
+## How It Works
 - **Values only go through `ctx.credentials.set(ref, value)`**: no second file, no writes
   to `.credentials.yaml` itself, no copies. An empty value is refused (in DSH semantics
   an empty value means unconfigured).
@@ -130,10 +127,12 @@ need not be file-backed, and the plugin should not assume where it lives.
   `credentials.describe()`, which is designed not to return a value.
 
 These statements are not source-reading claims: `npm test` actually drives the scene
-frame by frame — see Verification.
+frame by frame — see Development.
 
+- **Seams** — `ctx.tuiScenes` (full-screen scene), `ctx.commands` (command) and
+  `ctx.credentials` (the DSH core credential service). A missing scene seam degrades
+  silently into "nothing happens" and never breaks TUI startup.
 ## Storage
-
 | Content | Location | Mode |
 | --- | --- | --- |
 | Values (owned by DSH) | `<DSH_HOME>/.credentials.yaml` | 0600, guaranteed by the provider |
@@ -151,8 +150,7 @@ permissions are denied by default and require an entry in
 `~/.dsh-tui/extension-grants.json`. v1 chooses zero authorization and therefore writes to
 the plugin-private directory above.
 
-## Boundaries
-
+## Known Limitations
 - **The CLI is not a second store**: it writes the provider's file and takes the
   provider's lock. It lacks the provider's semantic completeness — the provider refuses a
   write shadowed by *its own* launch environment, while the CLI can only judge by its own
@@ -167,9 +165,8 @@ the plugin-private directory above.
   sections; once its settings screen renders a mask of its own, this scene can shrink to
   list management.
 
-## Verification
-
-```bash
+## Development
+```sh
 npm test        # = node scripts/verify.mjs
 ```
 
@@ -186,33 +183,12 @@ the host's own `@dsh-std/manifest` parser and the TUI profile validator.
   `yaml` package (parsing the file back to compare the value) and with the provider's real
   `withFileLock` (holding the lock against the CLI).
 
-## Compatibility
+Toolchain: Node `^22.19 || >=24`, ESM, no runtime dependencies;
+`@deepseek-ai/cordis` is an optional peer.
+Open contract questions are tracked in [docs/plugin-design.md](docs/plugin-design.md).
 
-- Only **`@deepseek-harness-tui/dsh-tui`** (read against 0.16.x; other TUI implementations
-  are out of scope).
-- Node `^22.19 || >=24`; ESM; no runtime dependencies; `@deepseek-ai/cordis` is an
-  optional peer.
-- Seams: `ctx.tuiScenes` (full-screen scene), `ctx.commands` (command), `ctx.credentials`
-  (the DSH core credential service). A missing scene seam degrades silently into "nothing
-  happens" and never breaks TUI startup.
-
-## Open contract questions
-
-1. **`Config` is not exported.** The plugin guide names three faces — `name`, `Config`,
-   `apply` — but this package's only config key, `entryCommand`, falls back via
-   `?? DEFAULTS` inside `apply`, with no Schemastery `Config` export. If profile manifest
-   validation requires one, adding a `@deepseek-ai/schemastery`
-   `Schema.object({...}).default(...)` is enough.
-2. **Command registration path.** The command defaults to the plugin-host mediated surface
-   `ctx.tuiPluginHost.registerCommand(ctx, definition)`, which stamps it with this plugin's
-   verified identity so the host's `commands.invoke` denies apply to it; when that surface
-   is missing or the registration is refused, it falls back to a direct
-   `ctx.commands.register` (same-process trust boundary). The declared contribution id in
-   `dsh-plugin.json` is `dsh-tui-secret.open`, which need not match the registered command
-   name `secrets` — a contribution id is a declaration identity, not a command name.
-
-Design notes: [docs/plugin-design.md](docs/plugin-design.md).
-
+## Documentation
+- **Design** — [plugin-design.md](docs/plugin-design.md) · [documentation index](docs/README.md)
+  · [dsh-TUI plugin guide](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/tui-profile/docs/plugin-admission-and-development.md)
 ## License
-
 [MIT](LICENSE)

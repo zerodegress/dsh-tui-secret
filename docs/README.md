@@ -1,9 +1,9 @@
 # 文档索引 / Documentation index
 
-根 README 只列"有什么"，细节都在这里。中文文档没有后缀，英文文档用 `.en.md`。
+根 README 只列"有什么"，细节都在这里。中文文档没有后缀，英文文档是 `.en.md`。
 The root README lists what ships; the details live here. Chinese files carry no suffix, English files use `.en.md`.
 
-## 设计 / Design
+## 实现 / Internals
 
 | 文档 / Doc | 中文 | English | 讲什么 / What it covers |
 | --- | --- | --- | --- |
