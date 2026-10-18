@@ -19,6 +19,23 @@
 > bypass DSH storage: it shares the credential provider's writer lock and atomic-write
 > protocol.
 
+## Highlights
+
+- **Masked entry inside the scene** — `/secrets` opens a full-screen scene: `a` starts a
+  reference, the value is typed with per-keystroke masking, `Enter` writes it.
+- **A fixed-length mask** — `••••` whatever the length: the screen shows neither the
+  characters nor how many there are.
+- **One value path only** — a value reaches `ctx.credentials` and nothing else; no tool, no
+  `tools/execute`, no `llm/stream`, no shell-env contributor.
+- **List and delete, values never shown** — the list reports configured state, source and
+  writability from `credentials.describe()`; deletion needs an explicit `y`.
+- **A CLI for scripts and non-TTY use** — `list` / `set` / `rm`, sharing the credential
+  provider's own writer lock and atomic write, fail-closed without an explicit value source.
+- **The declaration is gated** — `npm test` runs `dsh-plugin.json` through the host's own
+  parser and the TUI profile validator, so a drifted manifest fails locally.
+
+Usage: [Scene usage](#scene-usage) · [CLI](#cli). Design: [documentation index](docs/README.md).
+
 ## Install
 
 ```bash
@@ -168,41 +185,6 @@ the host's own `@dsh-std/manifest` parser and the TUI profile validator.
 - **The CLI half** runs the real entry point as a subprocess and cross-checks with the host
   `yaml` package (parsing the file back to compare the value) and with the provider's real
   `withFileLock` (holding the lock against the CLI).
-
-`21/21 PASS` today:
-
-```
-PASS  ① an empty value is refused: Enter writes nothing
-PASS  ② a reserved prefix is refused: DSH_ names are not accepted
-PASS  ③ per-keystroke masking: only a fixed mask on screen, no value and no length
-PASS  ④ the value reaches credentials.set only: zero hits in frames and logs
-PASS  ⑤ a short value (2 characters) also stays off screen
-PASS  ⑥ deletion needs an explicit y; any other key deletes nothing
-PASS  ⑥b with credentials missing, deletion is not reported as done
-PASS  ⑦ Esc closes the scene
-PASS  ⑧ a failed write reports the error code only, never the value or raw error text
-PASS  ⑨ apply touches two seams only and mounts no model-facing hook
-PASS  ⑩ the name index holds names only; file 0600, directory 0700
-PASS  ⑪ a damaged name index is neither overwritten nor fatal
-PASS  ⑫ real host render (real React + real ink): the mask repaints and no value lands on screen
-PASS  ⑬ cli set: a row-level upsert — comments, other keys and block scalars survive
-PASS  ⑭ cli set over an existing key: only that row changes, every other byte stays
-PASS  ⑮ cli and provider share one lock: a held lock means an error exit and no write
-PASS  ⑯ cli fail-closed: no source / empty value / reserved prefix / shadowed / wide mode all refuse and write nothing
-PASS  ⑰ cli rm: refused without --yes; with it, only that key goes
-PASS  ⑱ cli list: names and state only, no value anywhere in the output
-PASS  ⑲ cli set --dry-run: no write, no lock
-PASS  ⑳ the declaration passes the upstream parser and the TUI profile gate
-```
-
-`⑫` needs a dsh-TUI profile on the machine and `SKIP`s without one (`DSH_TUI_PROFILE=`
-points elsewhere); the two cross-checks in `⑬` and `⑮` likewise `SKIP` when the host
-`yaml` package or the provider's lock implementation is unavailable. A `SKIP` is not a
-failure.
-
-What it does **not** prove: a real terminal's scrollback and session recording, and
-writers outside the terminal (the web card, or `dsh` writing the same credential document).
-Those need a real terminal; the script does not stand in for manual testing.
 
 ## Compatibility
 

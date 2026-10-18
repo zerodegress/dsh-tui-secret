@@ -17,6 +17,21 @@
 > 同一份代码另带一个 `dsh-tui-secret` 命令行，给脚本与无 TTY 场景使用：它不绕开 DSH
 > 的存储，而是与凭据 provider **共用同一把写锁与同一套原子写**。
 
+## 功能亮点
+
+- **场景内掩码录入** — `/secrets` 打开一个全屏场景：按 `a` 新建引用，逐字掩码输入，`Enter` 写入。
+- **固定长度掩码** — 不论多长都是 `••••`：屏幕上既没有字符，也看不出长度。
+- **只有一条值通路** — 值只到 `ctx.credentials`：不注册工具、不挂 `tools/execute` 与
+  `llm/stream`、不注册 shell-env 贡献者。
+- **列表与删除，值永不上屏** — 列表只出 `credentials.describe()` 给的「是否已配置／来源／
+  可写性」；删除要显式按 `y`。
+- **给脚本与无 TTY 用的命令行** — `list` / `set` / `rm`，与凭据 provider **共用同一把写锁**
+  与同一套原子写；不给显式来源就 fail-closed。
+- **声明有闸门** — `npm test` 会把 `dsh-plugin.json` 送进宿主自己的解析器与 TUI profile
+  校验器，manifest 一漂本地就红。
+
+用法：[场景用法](#用法场景) · [命令行](#命令行)。设计说明：[文档索引](docs/README.md)。
+
 ## 安装
 
 ```bash
@@ -148,38 +163,6 @@ fail-closed），`⑳` 是插件声明 —— 用宿主自己的 `@dsh-std/manif
   ink，把场景渲进非 TTY 流逐帧 grep——元素符号、hook dispatcher、渲染路径都是真的。
 - **命令行那半**用子进程跑真实入口，并调用宿主的 `yaml` 包把文件解析回来比对值、
   用 provider 真正的 `withFileLock` 占锁对撞。
-
-当前 `21/21 PASS`：
-
-```
-PASS  ① an empty value is refused: Enter writes nothing
-PASS  ② a reserved prefix is refused: DSH_ names are not accepted
-PASS  ③ per-keystroke masking: only a fixed mask on screen, no value and no length
-PASS  ④ the value reaches credentials.set only: zero hits in frames and logs
-PASS  ⑤ a short value (2 characters) also stays off screen
-PASS  ⑥ deletion needs an explicit y; any other key deletes nothing
-PASS  ⑥b with credentials missing, deletion is not reported as done
-PASS  ⑦ Esc closes the scene
-PASS  ⑧ a failed write reports the error code only, never the value or raw error text
-PASS  ⑨ apply touches two seams only and mounts no model-facing hook
-PASS  ⑩ the name index holds names only; file 0600, directory 0700
-PASS  ⑪ a damaged name index is neither overwritten nor fatal
-PASS  ⑫ real host render (real React + real ink): the mask repaints and no value lands on screen
-PASS  ⑬ cli set: a row-level upsert — comments, other keys and block scalars survive
-PASS  ⑭ cli set over an existing key: only that row changes, every other byte stays
-PASS  ⑮ cli and provider share one lock: a held lock means an error exit and no write
-PASS  ⑯ cli fail-closed: no source / empty value / reserved prefix / shadowed / wide mode all refuse and write nothing
-PASS  ⑰ cli rm: refused without --yes; with it, only that key goes
-PASS  ⑱ cli list: names and state only, no value anywhere in the output
-PASS  ⑲ cli set --dry-run: no write, no lock
-PASS  ⑳ the declaration passes the upstream parser and the TUI profile gate
-```
-
-其中 `⑫` 依赖本机装有 dsh-TUI profile，未安装时 `SKIP`（可用 `DSH_TUI_PROFILE=` 指定
-位置），不算失败；`⑬⑮` 里对宿主 `yaml` 与 provider 真锁的两处对撞同样在缺件时 `SKIP`。
-
-它**不能**证明的：真机 TTY 的回滚缓冲与终端录像、终端之外的写入方（Web 卡片、`dsh`
-CLI 自己写同一份凭据文件）。这些要看真实终端，脚本不代替手测。
 
 ## 兼容性
 
