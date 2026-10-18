@@ -30,6 +30,14 @@ process.env.DSH_TUI_HOME = SCRATCH
 const SENTINEL = 'SENTINEL_p4ssw0rd_DO_NOT_LEAK_7f3a'
 const SENTINEL2 = 'x9'
 
+// The tests exercise the compiled package: `src/` is the source, `lib/types/` is tsc output
+// and is not in git (package.json's `pretest` compiles it). A missing build is reported as a
+// missing build, not as a module-resolution stack.
+if (!fs.existsSync(new URL('../lib/types/index.js', import.meta.url))) {
+  console.error('lib/types/index.js is missing — run `pnpm install` once, then `npm run compile` (or just `npm test`, which compiles first)')
+  process.exit(1)
+}
+
 const plugin = await import('../lib/types/index.js')
 const store = await import('../lib/types/store.js')
 const { makeScene } = plugin.__internals

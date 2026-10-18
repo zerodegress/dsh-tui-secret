@@ -16,7 +16,7 @@ The root README lists what ships; the details live here. Chinese files carry no 
 - 上游戏插件开发指南：[插件准入与开发](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/tui-profile/docs/plugin-admission-and-development.md)
 
 > 文档描述当前仓库版本；配置行为以 `package.json`、`cordis.patch.yml`、`dsh-plugin.json` 与
-> `lib/types/index.js` 实际组合为准。
+> `src/index.ts`（编译产物 `lib/types/index.js`）实际组合为准。
 > These guides describe the current repository version; configuration behaviour is governed by
 > `package.json`, `cordis.patch.yml`, `dsh-plugin.json` and the active composition in
-> `lib/types/index.js`.
+> `src/index.ts` (compiled to `lib/types/index.js`).

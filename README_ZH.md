@@ -145,8 +145,12 @@ provider 默认开启文件监听（`watch: true`），外部改完会自行 rel
 
 ## 开发
 ```sh
-npm test        # = node scripts/verify.mjs
+pnpm install    # 首次：装构建依赖（typescript / @types/node / @deepseek-ai/cordis，仅构建用）
+npm test        # = npm run compile && node scripts/verify.mjs
 ```
+
+源码是 `src/` 里的 TypeScript；`tsc` 把它编译进 `lib/types/` —— 宿主与命令行加载的是它，
+npm 包发的也是它。`lib/` 是产物、不进 git。
 
 脚本覆盖两半加一道闸门：`①–⑫` 是场景（哨兵验证），`⑬–⑲` 是命令行（写盘协议与
 fail-closed），`⑳` 是插件声明 —— 用宿主自己的 `@dsh-std/manifest` 解析器与 TUI profile 校验器
@@ -159,7 +163,8 @@ fail-closed），`⑳` 是插件声明 —— 用宿主自己的 `@dsh-std/manif
 - **命令行那半**用子进程跑真实入口，并调用宿主的 `yaml` 包把文件解析回来比对值、
   用 provider 真正的 `withFileLock` 占锁对撞。
 
-工具链：Node `^22.19 || >=24`，ESM，无运行时依赖；`@deepseek-ai/cordis` 是可选 peer。
+工具链：Node `^22.19 || >=24`，ESM，无运行时依赖；`@deepseek-ai/cordis` 是可选 peer。三个
+devDependencies 只服务构建与类型 —— 新克隆的仓库要先 `pnpm install`（联网）再 `npm test`。
 未决的契约项集中记在 [docs/plugin-design.md](docs/plugin-design.md)。
 
 ## 文档

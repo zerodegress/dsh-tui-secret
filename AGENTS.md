@@ -10,19 +10,21 @@ dsh-tui-secret 是 [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) 的密钥�
 ## 仓库布局
 
 ```
-lib/types/index.js   Cordis 插件入口：name / apply、/secrets 场景、打开它的命令
-lib/types/cli.js     命令行实现：list / set / rm、同锁行级 upsert、fail-closed 判据
-lib/types/store.js   引用名清单（只有名字）：$DSH_TUI_HOME/dsh-tui-secret/refs.json
-lib/types/index.d.ts 包根的公开类型面
-bin/dsh-tui-secret.mjs  bin 薄入口，实现全在 lib/types/cli.js
+src/index.ts          Cordis 插件入口：name / apply、/secrets 场景、打开它的命令
+src/cli.ts            命令行实现：list / set / rm、同锁行级 upsert、fail-closed 判据
+src/store.ts          引用名清单（只有名字）：$DSH_TUI_HOME/dsh-tui-secret/refs.json
+bin/dsh-tui-secret.mjs  bin 薄入口，实现全在 src/cli.ts
+tsconfig.json        tsc 配置：src/ → lib/types/（`declaration`，不带 declarationMap）
 scripts/verify.mjs   验收脚本（npm test）：场景哨兵验证 + 命令行写盘协议验证
 docs/                根 README 之外的文档；中文无后缀，英文 .en.md
 cordis.patch.yml     profile 组合用的包级覆盖层；本包只有一行插件
 dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ```
 
-**`lib/` 就是这个包的源码，不是构建产物**（与上游 dsh-TUI 的 `src/` → `lib/` 不同），
-没有编译步骤，直接改这里。
+**`src/` 是真源，`lib/types/` 是 `tsc` 的产物**（与上游 dsh-TUI 同一形状）：`lib/` 不进 git
+（见 `.gitignore`），改代码只改 `src/`，改完 `pnpm install`（首次）→ `npm run compile` 重新
+生成；`npm test` 会先编译再验（`pretest`）。手写的 `index.d.ts` 没有了 —— 包的类型面由 `tsc`
+从 `src/index.ts` 生成，`@internal` 的测试入口用 `stripInternal` 剔除。
 
 完整仓库地图、设计依据与实测事实见 [docs/plugin-design.md](docs/plugin-design.md)；
 文档索引见 [docs/README.md](docs/README.md)。
@@ -30,16 +32,22 @@ dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ## 命令
 
 ```sh
-npm test        # = node scripts/verify.mjs：场景 ①–⑫ + 命令行 ⑬–⑲ + ⑳ 声明闸门，21/21 PASS 为通过
+pnpm install    # 首次：装构建依赖（typescript / @types/node / @deepseek-ai/cordis）
+npm run compile # = tsc -p tsconfig.json：src/ → lib/types/
+npm test        # 先编译再验：场景 ①–⑫ + 命令行 ⑬–⑲ + ⑳ 声明闸门，21/21 PASS 为通过
 npm run verify  # 同一入口
-npm pack --dry-run          # 检查发布内容（npm 缓存不在工作区时加 npm_config_cache=<目录>）
+npm run typecheck   # tsc --noEmit，静态关口
+npm pack --dry-run          # 检查发布内容（15 文件；npm 缓存不在工作区时加 npm_config_cache=<目录>）
 dsh plugin --profile dsh-tui add <本仓路径>   # 本地试装（会动 profile，先问维护者）
 ```
 
-仓库**没有** lint、类型检查或根级测试框架：静态关口是 `node --check`，行为验证就是
+仓库**没有** lint 或根级测试框架：静态关口是 `npm run typecheck` 与 `node --check`，行为验证就是
 `scripts/verify.mjs`。脚本里对宿主真件的两处交叉验证（用宿主 `yaml` 包解析回读、用
 provider 真 `withFileLock` 占锁）在缺件时打印 `SKIP`，`SKIP` 不算失败，但**不要**把
 `SKIP` 当通过报出去。
+
+**本仓从 0.1.0 起不再是「零依赖、无构建」**：克隆下来要联网 `pnpm install`，`lib/` 不进 git，
+测试与 `npm pack` 跑的都是编译产物（`package.json` 的 `pretest` / `prepare` 负责编译）。
 
 ## 上游边界与契约
 
@@ -57,6 +65,8 @@ provider 真 `withFileLock` 占锁）在缺件时打印 `SKIP`，`SKIP` 不算�
   会话的改动都视为回归。
 - **fail-closed**：任何前提缺失（空值、非法名、保留前缀、被环境遮蔽、权限过宽、
   文件形状不可安全解析、等不到锁）都拒绝退出，不猜、不静默降级。
+- **`lib/` 是产物**：源代码只在 `src/`，绝不手改 `lib/types/` 下任何文件；改完跑
+  `npm run compile`（或 `npm test`，它会先编译），提交前确认 `npm run typecheck` 干净。
 - **文本语言**：源码注释、用户可见的界面与命令行文案、测试标签一律英文（与上游默认一致）；
   `README.md` 英文为底、`README_ZH.md` 中文镜像；`docs/` 中文无后缀、英文用 `.en.md`。
 - **提交信息**：英文 conventional commits，带 scope，例：`docs(style): align all text with the
@@ -76,7 +86,7 @@ provider 真 `withFileLock` 占锁）在缺件时打印 `SKIP`，`SKIP` 不算�
 审查改动时，以**不引入新 Bug、最小必要改动、保持代码简洁**为核心原则：
 
 1. **防止回归**：优先看新增的泄漏路径（值进 state／日志／错误文本／会话）、竞态（锁与锁内
-   重读）、资源泄漏（`ctx.effect` 缺清理）与 fail-closed 缺口；特别关注 `lib/` 三个文件之间的
+   重读）、资源泄漏（`ctx.effect` 缺清理）与 fail-closed 缺口；特别关注 `src/` 三个文件之间的
    共享不变量，以及 `scripts/verify.mjs` 的断言是否仍覆盖新行为。
 2. **避免过度设计**：识别重复实现、无必要的抽象与冗余封装；只有存在更简单的等效方案时才
    报告，不误判必要的安全校验。

@@ -66,7 +66,7 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 - 值存 `useRef`，**不进 React state**（state 会被调试器与序列化看到）；提交前先在本地
   丢弃，失败也不留在 state 里。
 - 显示恒为固定长度占位，输入长度不参与渲染——按长度画点的掩码本身就泄漏信息。
-- 每次按键只用一个「重绘计数」state 触发重绘（`lib/types/index.js` 的 `repaint()`），
+- 每次按键只用一个「重绘计数」state 触发重绘（`src/index.ts` 的 `repaint()`），
   计数里装的永远是次数，不是值。
 
 不使用宿主 `dialog.input()` 的原因同上：它是普通单行输入，没有 secret 选项。
@@ -81,8 +81,8 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 名字清单是索引而非密钥库：只有名字，没有值。它落在插件私有目录、不读 `.credentials.yaml`，
 因为 provider 未必是文件实现，插件不应假定凭据存在哪里。
 
-命令行（`bin/dsh-tui-secret.mjs` → `lib/types/cli.js`）是无 TTY 场景的补充入口。它不是
-第二套存储：写的就是 provider 那个文件，并用同一把锁（`lib/types/cli.js` 的
+命令行（`bin/dsh-tui-secret.mjs` → `src/cli.ts`）是无 TTY 场景的补充入口。它不是
+第二套存储：写的就是 provider 那个文件，并用同一把锁（`src/cli.ts` 的
 `withWriterLock`）与同一套原子写。三条硬前提：
 
 1. **同一把锁**：锁路径 = `<凭据文件>.lock`，`wx` 独占创建，等不到就报错退出；不猜锁
@@ -108,7 +108,8 @@ waterfall），本插件不写遥测，因此不需要在那里挂脱敏规则�
 
 ## 验证
 
-`npm test` 跑 `scripts/verify.mjs`，两层证据：
+`npm test` = `npm run compile` + `scripts/verify.mjs`，两层证据（源代码是 `src/` 里的
+TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编译产物）：
 
 - **场景层**（`①–⑫`）：自写最小 React hook runtime 与 ui kit 替身，把场景真正跑起来，
   按真人按键顺序驱动，记录每一帧渲染字符串、每一条日志、每一次对外调用，再用哨兵值
@@ -132,5 +133,6 @@ waterfall），本插件不写遥测，因此不需要在那里挂脱敏规则�
 ## 兼容性
 
 - 只支持 `@deepseek-harness-tui/dsh-tui` 0.16.x；其他 TUI 实现不在目标内。
-- Node `^22.19 || >=24`；ESM；无运行时依赖。
+- Node `^22.19 || >=24`；ESM；无运行时依赖；构建依赖只有 `typescript` / `@types/node` /
+  `@deepseek-ai/cordis`（首次要联网 `pnpm install`，`lib/` 不入库）。
 - 接缝缺席时静默降级：场景面不在就什么都不注册，绝不拖垮 TUI 启动。

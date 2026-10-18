@@ -167,8 +167,12 @@ the plugin-private directory above.
 
 ## Development
 ```sh
-npm test        # = node scripts/verify.mjs
+pnpm install    # first run: typescript / @types/node / @deepseek-ai/cordis (build only)
+npm test        # = npm run compile && node scripts/verify.mjs
 ```
+
+The source is TypeScript in `src/`; `tsc` compiles it into `lib/types/`, which is what the host
+and the CLI load and what the npm package ships. `lib/` is generated and is not in git.
 
 The script covers both halves plus one gate: `①–⑫` the scene (sentinel checks), `⑬–⑲` the
 CLI (write protocol and fail-closed behaviour), and `⑳` the plugin declaration, run through
@@ -184,7 +188,8 @@ the host's own `@dsh-std/manifest` parser and the TUI profile validator.
   `withFileLock` (holding the lock against the CLI).
 
 Toolchain: Node `^22.19 || >=24`, ESM, no runtime dependencies;
-`@deepseek-ai/cordis` is an optional peer.
+`@deepseek-ai/cordis` is an optional peer. The three devDependencies are for the build and the
+types only — a fresh clone needs `pnpm install` (network) before `npm test`.
 Open contract questions are tracked in [docs/plugin-design.md](docs/plugin-design.md).
 
 ## Documentation
