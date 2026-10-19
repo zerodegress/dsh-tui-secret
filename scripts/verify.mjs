@@ -186,28 +186,45 @@ await check('② a reserved prefix is refused: DSH_ names are not accepted', asy
   view.press('\u001b', { escape: true }) // back to the list
 })
 
-const maskFrames = []
-await check('③ per-keystroke masking: only a fixed mask on screen, no value and no length', async () => {
+const echoFrames = []
+await check('③ per-keystroke echo: one • per character, never the value', async () => {
   view.press('a')
   for (const ch of 'MY_TOKEN') view.press(ch)
   view.press('\r', { return: true })
   assert(view.text.includes('step 2'), `did not reach the value step: ${view.text}`)
+  let typed = 0
   for (const ch of SENTINEL) {
     view.press(ch)
+    typed += 1
     const frame = view.text
-    maskFrames.push(frame)
+    echoFrames.push(frame)
     assert(!frame.includes(SENTINEL), 'the full sentinel value reached the screen')
     // Only the value line is checked for echoed characters: short prefixes of the sentinel
     // also occur in ordinary prose on the same frame, so scanning the whole frame for a
-    // single letter would be a false positive. A value line that is nothing but mask
-    // characters is a strictly stronger statement anyway.
+    // single letter would be a false positive.
     const segment = frame.match(/Value: (\S*)/)?.[1] ?? ''
-    assert(/^\u2022+$/.test(segment), `the value line shows something other than the mask: "${segment}"`)
+    assert(segment === '\u2022'.repeat(typed), `the echo is not one • per character: "${segment}" (typed ${typed})`)
   }
-  const masks = maskFrames.map((frame) => frame.match(/Value: (\S*)/)?.[1] ?? '')
-  assert(masks.every((mask) => mask === masks[0]), `the mask changed with length: ${JSON.stringify(masks)}`)
-  assert(masks[0].includes('\u2022'), `no mask was drawn (a ref change alone does not repaint?): "${masks[0]}"`)
-  assert(!/\d/.test(masks[0]), `the mask contains digits (a length hint): ${masks[0]}`)
+  assert(echoFrames.length === SENTINEL.length, 'not every keystroke repainted the echo')
+
+  // `echo: none` is the strict alternative: no characters and no length, so a shoulder-surfer
+  // cannot even count the keystrokes. Driven on a second mount so the default flow stays intact.
+  const silent = makeScene({
+    getCredentials: () => credentials,
+    store: { loadNames: () => [], addName: () => {}, removeName: () => {} },
+    logger: { info: () => {}, warn: () => {} },
+    echo: 'none',
+  })
+  const quiet = mount(silent, { channel: {}, close: () => {} })
+  await flush()
+  quiet.press('a')
+  for (const ch of 'SILENT') quiet.press(ch)
+  quiet.press('\r', { return: true })
+  for (const ch of 'abcd') quiet.press(ch)
+  const silentSegment = quiet.text.match(/Value: (\S*)/)?.[1] ?? ''
+  assert(silentSegment === '', `echo none still shows feedback: "${silentSegment}"`)
+  assert(!quiet.text.includes('\u2022'), 'echo none still draws dots')
+  assert(quiet.frames.every((frame) => !frame.includes('abcd')), 'echo none echoed the value')
 })
 
 await check('④ the value reaches credentials.set only: zero hits in frames and logs', async () => {
@@ -445,7 +462,7 @@ await check('⑪ a damaged name index is neither overwritten nor fatal', async (
 // what a stand-in cannot — this is the group that caught "the mask is driven by a ref alone,
 // so the screen never repaints".
 // It needs a dsh-TUI profile on this machine; without one it SKIPs rather than failing.
-await check('⑫ real host render (real React + real ink): the mask repaints and no value lands on screen', async () => {
+await check('⑫ real host render (real React + real ink): the echo repaints and no value lands on screen', async () => {
   const profile = process.env.DSH_TUI_PROFILE ?? path.join(os.homedir(), '.dsh/profiles/dsh-tui')
   const pkg = path.join(profile, 'node_modules/@deepseek-harness-tui/dsh-tui/lib/types/ui.js')
   const reactEntry = path.join(profile, 'node_modules/react/index.js')
@@ -496,17 +513,14 @@ await check('⑫ real host render (real React + real ink): the mask repaints and
     await tap('\r', { return: true })
     assert(out.includes('step 2'), 'did not reach the value step')
 
-    const masks = []
+    let typed = 0
     for (const ch of SENTINEL) {
       await tap(ch)
+      typed += 1
       assert(!out.includes(SENTINEL), 'the sentinel value appeared in the real host render')
       const segment = frame().match(/Value: (\S*)/)?.[1] ?? ''
-      masks.push(segment)
-      assert(/^\u2022+$/.test(segment), `the value line shows something other than the mask: "${segment}"`)
+      assert(segment === '\u2022'.repeat(typed), `the value line is not one • per character: "${segment}" (typed ${typed})`)
     }
-    assert(masks.every((mask) => mask === masks[0]), `the mask changed with length: ${JSON.stringify(masks)}`)
-    assert(masks[0].includes('\u2022'), `no mask was drawn (a ref change alone does not repaint?): "${masks[0]}"`)
-    assert(!/\d/.test(masks[0]), `the mask contains digits: ${masks[0]}`)
 
     await tap('\r', { return: true })
     await tick()
@@ -869,10 +883,11 @@ await check('㉞ session scope is judged by session id and never clears itself',
   assert(fs.readFileSync(auditFile(home), 'utf8').split('\n').filter((line) => line.includes('"used"')).length === 2, 'the audit misses a use')
 })
 
-await check('㉟ the card: the agent asks, the human picks a scope, the value is stored once', async () => {
+await check('㉟ the card: one dialog — type, pick a scope, Enter', async () => {
   freshTuiHome('card')
   const settled = []
   const setCalls = []
+  const closes = []
   const pending = { ref: 'ALPHA_TOKEN', purpose: 'call the internal API', sessionId: 'session-a' }
   const channel = {
     request: async () => ({ kind: 'refused' }),
@@ -886,19 +901,29 @@ await check('㉟ the card: the agent asks, the human picks a scope, the value is
     logger: { info: () => {}, warn: () => {} },
     channel,
   })
-  const view = mount(scene, { channel: {}, close: () => {} })
+  const view = mount(scene, { channel: {}, close: () => closes.push(true) })
   await flush()
   view.render()
-  assert(view.text.includes('A credential is requested'), `the card did not open: ${view.text}`)
+  // Everything the user needs is on this one screen: the reference, the purpose, the value row
+  // and every scope option. No list to navigate, no second value step.
+  assert(view.text.includes('Credential requested: ALPHA_TOKEN'), `the dialog did not open: ${view.text}`)
   assert(view.text.includes('call the internal API'), 'the purpose is not shown')
-  view.press('2')       // "agent may use it once"
+  assert(view.text.includes('Value:'), 'the dialog has no value row')
+  assert(view.text.includes('agent may use it once'), 'the scope options are not on the same screen')
+
   view.press('\r', { return: true })
+  assert(view.text.includes('type the value first'), 'Enter on an empty value was accepted')
+
+  // Digits belong to the value: the scope is ↑/↓ only, so a token with numbers is not eaten.
   for (const ch of SENTINEL) view.press(ch)
-  assert(!view.text.includes(SENTINEL), 'the card echoed the value')
+  assert(!view.text.includes(SENTINEL), 'the dialog echoed the value')
+
+  view.press('', { downArrow: true }) // none -> once
   view.press('\r', { return: true })
   await flush()
   assert(setCalls.length === 1 && setCalls[0].value === SENTINEL, `the value never reached credentials.set: ${JSON.stringify(setCalls)}`)
   assert(settled.length === 1 && settled[0].kind === 'stored' && settled[0].scope === 'once', `the card settled wrong: ${JSON.stringify(settled)}`)
+  assert(closes.length === 1, 'the dialog did not close after storing')
   assert(!JSON.stringify(settled).includes(SENTINEL), 'the settled outcome carries the value')
   assert(view.frames.every((frame) => !frame.includes(SENTINEL)), 'a rendered frame holds the value')
 })

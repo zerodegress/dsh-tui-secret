@@ -47,12 +47,22 @@ const USE_TOOL = 'use_credential'
 const DEFAULT_TIMEOUT_MS = 30_000
 const MAX_TIMEOUT_MS = 300_000
 
-/** The one configuration key (defaulted; a missing key degrades to the default behaviour and never breaks TUI startup). */
+/**
+ * How the value line echoes what was typed.
+ * - `dots` (default): one `•` per character, like a conventional password field. The length is
+ *   visible; the characters are not.
+ * - `none`: no per-keystroke output at all. The label stays put while the value is typed blind.
+ */
+export type EchoMode = 'dots' | 'none'
+
+/** Configuration keys (all defaulted; a missing key degrades to the default behaviour and never breaks TUI startup). */
 export interface Config {
   /** Slash-command name that opens the scene, without the slash. Defaults to `secrets`. */
   entryCommand?: string
   /** Scene title, for logs and debugging. Defaults to `Secrets`. */
   title?: string
+  /** Echo mode for the value line. Defaults to `dots`; `none` hides even the length. */
+  echo?: EchoMode
 }
 
 /** Exported for tests and documentation: the defaults this plugin declares. */
@@ -61,6 +71,8 @@ export const DEFAULTS: Required<Config> = {
   entryCommand: 'secrets',
   /** Scene title, for logs and debugging; the scene draws its own header. */
   title: 'Secrets',
+  /** One `•` per character: the conventional password look. `none` is the strict alternative. */
+  echo: 'dots',
 }
 
 // ------------------------------------------------------------------ the host seams we consume
@@ -199,7 +211,7 @@ interface Row {
   grant: string
 }
 
-type Mode = 'list' | 'name' | 'value' | 'confirm' | 'request-scope' | 'request-value' | 'revoke-all'
+type Mode = 'list' | 'name' | 'value' | 'confirm' | 'request' | 'revoke-all'
 
 /** How the four scopes read on the screen. */
 const SCOPE_LABEL: Record<Scope, string> = {
@@ -268,6 +280,9 @@ interface PendingRequest extends CardRequest {
  */
 export function apply(ctx: Context, config?: Config): void {
   const options: Required<Config> = { ...DEFAULTS, ...(config ?? {}) }
+  // A config file can carry any scalar; an unknown echo mode must fall back to the safe default
+  // instead of rendering something we did not define.
+  const echo: EchoMode = options.echo === 'none' ? 'none' : 'dots'
   const seams = ctx as unknown as HostSeams
 
   const store: NameStore = {
@@ -350,6 +365,7 @@ export function apply(ctx: Context, config?: Config): void {
     store,
     logger,
     channel,
+    echo,
     records: () => loadRecords(),
     revokeGrant: (ref: string) => revoke(ref),
     revokeEveryGrant: () => revokeAll(),
@@ -587,6 +603,7 @@ interface SceneDeps {
   store: NameStore
   logger: Logger
   channel?: CardChannel
+  echo?: EchoMode
   records?: () => RefRecord[]
   revokeGrant?: (ref: string) => boolean
   revokeEveryGrant?: () => string[]
@@ -597,8 +614,17 @@ interface SceneDeps {
  * (scripts/verify.mjs). React arrives through the scene props — the host React is a hard
  * contract — so nothing here imports a React of its own.
  */
-function makeScene({ getCredentials, store, logger, channel = new RefusingChannel(), records = () => [], revokeGrant = () => false, revokeEveryGrant = () => [] }: SceneDeps): SceneComponent {
-  const MASK = '\u2022\u2022\u2022\u2022' // fixed-length placeholder: neither the value nor its length
+function makeScene({ getCredentials, store, logger, channel = new RefusingChannel(), echo = 'dots', records = () => [], revokeGrant = () => false, revokeEveryGrant = () => [] }: SceneDeps): SceneComponent {
+  /**
+   * The value line. `dots` is the conventional password look — one `•` per character, so the
+   * length is visible by design. `none` draws nothing while typing: no characters and no length,
+   * which is the stricter choice for a shared screen. `•` (not `*`) also avoids fonts that
+   * ligate a run of three asterisks into a decorative glyph.
+   */
+  const echoLine = (value: string): string => {
+    if (echo === 'none') return ''
+    return '\u2022'.repeat(value.length)
+  }
 
   return function SecretsScene(props: SceneProps): unknown {
     const { React, ui, close } = props
@@ -611,8 +637,11 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
     const [notice, setNotice] = React.useState('')
     const [scope, setScope] = React.useState<Scope>('none')
     const valueRef = React.useRef('') // the value stays out of state: state is visible to debuggers and serializers
-    // A ref change does not repaint, and the mask has to follow every keystroke. This
-    // counter state forces the repaint; it counts repaints and never holds the value.
+    // True while the dialog's write is in flight: a second Enter must not start a second write.
+    const busyRef = React.useRef(false)
+    // A ref change does not repaint, and the echo has to follow every keystroke (with
+    // `echo: none` the empty → non-empty transition is the only visible change). This counter
+    // state forces the repaint; it counts repaints and never holds the value.
     const [, bumpPaint] = React.useState(0)
     const repaint = (): void => bumpPaint((n) => n + 1)
 
@@ -623,8 +652,10 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
 
     React.useEffect(() => {
       if (!request || mode !== 'list') return undefined
+      // One dialog for the whole request: the value and the scope share a screen, so a request is
+      // "type, pick, Enter" — not a list to navigate and not a second value step.
       setScope(offeredScopes(request.sessionId)[0])
-      setMode('request-scope')
+      setMode('request')
       return undefined
     }, [request, mode])
 
@@ -739,26 +770,25 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
         if (input && !key?.ctrl && !key?.meta) { valueRef.current += input; repaint(); return }
         return
       }
-      if (mode === 'request-scope') {
-        const options = offeredScopes(request?.sessionId)
-        if (key?.escape) { channel.settle({ kind: 'cancelled' }); setNotice('request cancelled'); back(); return }
-        if (input === 'r') { channel.settle({ kind: 'refused' }); setNotice('request refused'); back(); return }
-        if (key?.return) { valueRef.current = ''; setMode('request-value'); return }
-        if (key?.upArrow || key?.downArrow) {
-          const index = options.indexOf(scope)
-          const next = key?.upArrow ? (index <= 0 ? options.length - 1 : index - 1) : (index + 1) % options.length
-          setScope(options[next])
+      if (mode === 'request') {
+        if (busyRef.current) return
+        const scopes = offeredScopes(request?.sessionId)
+        if (key?.escape) {
+          channel.settle({ kind: 'cancelled' })
+          close() // the dialog is done; the chat is where the agent's answer shows up
           return
         }
-        if (input >= '1' && input <= String(options.length)) { setScope(options[Number(input) - 1]); return }
-        return
-      }
-      if (mode === 'request-value') {
-        if (key?.escape) { valueRef.current = ''; setMode('request-scope'); return }
+        if (key?.upArrow || key?.downArrow) {
+          // Not 1-4: in this dialog every printable key belongs to the value, digits included.
+          const index = scopes.indexOf(scope)
+          const next = key?.upArrow ? (index <= 0 ? scopes.length - 1 : index - 1) : (index + 1) % scopes.length
+          setScope(scopes[next])
+          return
+        }
         if (key?.return) {
           const secretName = initialiseName(request?.ref ?? '')
           if (!credentials) { channel.settle({ kind: 'refused' }); setNotice('credentials service unavailable, nothing written'); back(); return }
-          if (valueRef.current.length === 0) { setNotice('empty value, nothing written'); return }
+          if (valueRef.current.length === 0) { setNotice('type the value first'); return }
           if (process.env[secretName]) {
             // Same rule as the manual path: an environment value outranks the file, so a write
             // here would only look successful. Tell the agent "refused" and write nothing.
@@ -769,20 +799,22 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
           }
           const payload = valueRef.current
           valueRef.current = ''
-          setMode('list')
+          busyRef.current = true
+          setNotice('writing…')
           // The card is settled only after the store accepted the value: a tool that answered
           // "stored" while the write was still failing would be lying to the model.
           void Promise.resolve()
             .then(() => credentials.set(secretName, payload))
             .then(() => {
               channel.settle({ kind: 'stored', scope })
-              setNotice(`wrote ${secretName} (${SCOPE_LABEL[scope]})`)
-              refresh()
+              close() // one dialog, then straight back to the chat
             })
             .catch((error: unknown) => {
+              busyRef.current = false
               channel.settle({ kind: 'refused' })
               logger.warn(`set ${secretName} failed: ${failureLabel(error)}`)
               setNotice(`write failed (${failureLabel(error)})`)
+              back()
             })
           return
         }
@@ -830,10 +862,9 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
     const title = mode === 'list' ? 'Secrets (/secrets)'
       : mode === 'name' ? 'New reference · step 1: name'
         : mode === 'value' ? `New reference · step 2: value (${initialiseName(nameBuf)})`
-          : mode === 'request-scope' ? `A credential is requested (${request?.ref ?? ''})`
-            : mode === 'request-value' ? `Value for ${request?.ref ?? ''}`
-              : mode === 'revoke-all' ? 'Revoke every agent permission?'
-                : `Delete ${rows[cursor]?.name ?? ''}?`
+          : mode === 'request' ? `Credential requested: ${request?.ref ?? ''}`
+            : mode === 'revoke-all' ? 'Revoke every agent permission?'
+              : `Delete ${rows[cursor]?.name ?? ''}?`
 
     const body: unknown[] = []
     if (mode === 'list') {
@@ -843,39 +874,44 @@ function makeScene({ getCredentials, store, logger, channel = new RefusingChanne
         body.push(h(Text, { key: row.name, ...(index === cursor ? { inverse: true } : {}) },
           `${index === cursor ? '>' : ' '} ${row.name}  ${row.state}${row.grant}`))
       })
-      body.push(h(Text, { key: 'note', dimColor: true }, 'Agent use goes through the plugin tools only; another plugin reading the same reference is outside our reach.'))
     } else if (mode === 'name') {
       body.push(h(Text, { key: 'name' }, `Name: ${nameBuf || '(uppercase letters, digits, underscore)'}`))
       body.push(h(Text, { key: 'key', dimColor: true }, 'Enter next · Esc back'))
     } else if (mode === 'value') {
-      body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
-      body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter writes · Esc discards'))
-      // Always shown, never conditional: a hint that appeared only for short values would leak the
-      // length the mask exists to hide.
-      body.push(h(Text, { key: 'short', dimColor: true }, 'a very short value replaces every match of it in later command output'))
-    } else if (mode === 'request-scope') {
-      body.push(h(Text, { key: 'purpose' }, `Purpose: ${request?.purpose ?? ''}`))
-      const options = offeredScopes(request?.sessionId)
-      options.forEach((option, index) => {
+      body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? echoLine(valueRef.current) : '(waiting for input)'}`))
+      body.push(h(Text, { key: 'key', dimColor: true }, 'Enter saves · Esc cancels'))
+    } else if (mode === 'request') {
+      // One screen: the value and the scope together. No list, no separate value step — type,
+      // pick with ↑/↓, Enter, and the dialog closes back to the chat.
+      const scopes = offeredScopes(request?.sessionId)
+      body.push(h(Text, { key: 'purpose', dimColor: true }, `Purpose: ${request?.purpose ?? ''}`))
+      body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? echoLine(valueRef.current) : '(type it)'}`))
+      scopes.forEach((option) => {
         body.push(h(Text, { key: option, ...(option === scope ? { inverse: true } : {}) },
-          `${option === scope ? '>' : ' '} ${index + 1}. ${SCOPE_LABEL[option]}`))
+          `${option === scope ? '>' : ' '} ${SCOPE_LABEL[option]}`))
       })
-      body.push(h(Text, { key: 'key', dimColor: true }, '1-4 / ↑↓ choose · Enter next · r refuse · Esc cancel'))
-    } else if (mode === 'request-value') {
-      body.push(h(Text, { key: 'value' }, `Value: ${valueRef.current.length > 0 ? MASK : '(waiting for input)'}`))
-      body.push(h(Text, { key: 'key', dimColor: true }, 'masked · Enter stores · Esc back'))
-      body.push(h(Text, { key: 'short', dimColor: true }, 'a very short value replaces every match of it in later command output'))
+      body.push(h(Text, { key: 'key', dimColor: true }, 'Enter saves · ↑/↓ scope · Esc cancels'))
     } else if (mode === 'revoke-all') {
-      body.push(h(Text, { key: 'warn' }, 'Every agent permission becomes "not allowed"; the stored values stay. y confirms · n/Esc cancels'))
+      body.push(h(Text, { key: 'warn' }, 'Every agent permission is revoked; stored values stay. y confirms · n/Esc cancels'))
     } else {
-      body.push(h(Text, { key: 'warn' }, 'This removes the name from the DSH credential store. y confirms · n/Esc cancels'))
+      body.push(h(Text, { key: 'warn' }, 'This deletes the reference and its stored value. y confirms · n/Esc cancels'))
     }
     if (notice) body.push(h(Text, { key: 'notice', color: 'yellow' }, notice))
 
-    return h(Box, { flexDirection: 'column', paddingX: 1, borderStyle: 'round' },
-      h(Text, { key: 'title', bold: true }, title),
-      h(Text, { key: 'disc', dimColor: true }, 'Values reach ctx.credentials only: never echoed, never logged, never in the conversation.'),
-      ...body)
+    // Centered like a dialog: the outer box fills the screen and the inner one is the card. The
+    // list stays top-aligned (a long reference list must not clip its own header); every dialog
+    // mode centers both ways. Width is responsive with a cap, so a wide terminal does not stretch
+    // the card and a narrow one still fits.
+    return h(Box, {
+      flexDirection: 'column',
+      flexGrow: 1,
+      width: '100%',
+      alignItems: 'center',
+      justifyContent: mode === 'list' ? 'flex-start' : 'center',
+    },
+      h(Box, { flexDirection: 'column', paddingX: 1, borderStyle: 'round', width: '80%', maxWidth: 76 },
+        h(Text, { key: 'title', bold: true }, title),
+        ...body))
   }
 }
 

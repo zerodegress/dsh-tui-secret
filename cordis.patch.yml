@@ -7,3 +7,4 @@
       name: dsh-tui-secret
       config:
         entryCommand: secrets
+        # echo: dots    # one '•' per character (default); 'none' draws nothing at all

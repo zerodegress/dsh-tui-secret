@@ -23,8 +23,8 @@
 ## Highlights
 - **Masked entry inside the scene** — `/secrets` opens a full-screen scene: `a` starts a
   reference, the value is typed with per-keystroke masking, `Enter` writes it.
-- **A fixed-length mask** — `••••` whatever the length: the screen shows neither the
-  characters nor how many there are.
+- **Per-character echo** — the value line shows one `•` per character, like a password
+  field. Set `echo: none` to draw nothing at all (not even the length).
 - **The agent asks, you decide** — `request_credential(ref, purpose)` shows a card with the
   name, the purpose and four choices: not allowed / once / this session / until a time.
 - **Stored, never handed over** — the value reaches `ctx.credentials` and nothing else; the
@@ -54,6 +54,7 @@ Or add one row to the profile's `cordis.patch.yml` (this package's own
       name: dsh-tui-secret
       config:
         entryCommand: secrets   # any other command name works too
+        echo: dots              # one • per character; 'none' hides even the length
 ```
 
 Restart the TUI and type `/secrets`.
@@ -84,10 +85,11 @@ neither tool ever returns one.
 | `R` | Revoke every agent permission (`y` confirms; the stored values stay) |
 | `↑` `↓` | Move the selection |
 | `Enter` | Next step / write |
-| `Esc` | Back one step; on the list, `Esc` (or `q`) closes the scene |
+| `Esc` | Back one step; on a card, cancel; on the list, close the scene |
 
-On a card the agent asked for: `1`–`4` (or `↑`/`↓`) pick the permission, `Enter` moves on,
-`r` refuses, `Esc` cancels.
+On a card the agent asked for, everything is on one screen: type the value (masked), `↑`/`↓`
+picks the permission, `Enter` stores it and closes straight back to the chat, `Esc` cancels.
+Digits are part of the value, so the permission is arrows only.
 
 Names follow DSH rules: start with an uppercase letter, `A-Z 0-9 _` only, at most 64
 characters. `DEEPSEEK_` / `DSH_` prefixes belong to the host — the plugin refuses them on
@@ -100,8 +102,9 @@ silently drop the ref later.
   an empty value means unconfigured).
 - **No value in React state**: it lives in a `useRef` and is dropped locally before the
   write, so a failure leaves nothing behind in state.
-- **The mask is a fixed-length placeholder (`••••`)**: it neither echoes characters nor
-  reveals the length — a per-character dot mask already leaks information.
+- **The default echo reveals the value's length**: one `•` per character is the
+  conventional look, but the count is visible on screen and in scrollback. Use
+  `echo: none` when the length itself must not be shown (a shared screen, a recording).
 - **No shellEnv contributor is registered**: `$NAME` never enters the environment the model
   executes in. The only environment that ever holds the value is the one child process
   `use_credential` spawns.
@@ -154,8 +157,7 @@ the plugin-private directory above.
 - **A short value can make output unreadable**: redaction replaces **every** occurrence (the safe
   choice — replacing only the first would leak the rest) and the scene accepts two-character values,
   so a short one rewrites every matching substring in a command's output. The replacement is a single
-  pass, so a value that happens to be `credential` does not get substituted twice. The card carries a
-  standing note about this (made conditional, it would leak the value's length).
+  pass, so a value that happens to be `credential` does not get substituted twice.
 - **`session` permissions never expire on their own**: resuming a session creates a new agent
   with the same session id, so nothing can tell "this session is gone for good". Revoke them
   yourself (`v`, `R`), or delete the reference. Only `once` and `until` clear themselves.
