@@ -453,7 +453,10 @@ function requestCredentialTool(deps: ToolDeps): ToolDefinitionLike {
       if (outcome.kind !== 'stored') {
         // A refusal or a cancellation writes nothing at all — no record, no audit line.
         deps.logger.info(`${REQUEST_TOOL} ${ref}: ${outcome.kind}`)
-        return { status: outcome.kind, ref, note: noCardNote(deps.channel, outcome.kind) }
+        // Omit `note` instead of setting it to undefined: the host rejects any tool result that is
+        // not losslessly JSON, and an own property holding `undefined` is exactly that.
+        const note = noCardNote(deps.channel, outcome.kind)
+        return note === undefined ? { status: outcome.kind, ref } : { status: outcome.kind, ref, note }
       }
       markStored(ref, { scope: outcome.scope, purpose, sessionId })
       appendAudit({ event: 'request', ref, purpose, sessionId })
@@ -484,18 +487,36 @@ function useCredentialTool(deps: ToolDeps): ToolDefinitionLike {
       },
     },
     output: {
+      // Two shapes, because a refusal is a normal result here: `oneOf` is in the host's supported
+      // schema subset (exactly one branch must match), and the old single object shape made every
+      // refusal an INVALID_TOOL_OUTPUT error — the note never reached the model.
       schema: {
-        type: 'object',
-        required: ['exitCode', 'stdout', 'stderr', 'redacted', 'timedOut', 'aborted', 'injectedAs'],
-        properties: {
-          exitCode: { type: 'number' },
-          stdout: { type: 'string' },
-          stderr: { type: 'string' },
-          redacted: { type: 'boolean' },
-          timedOut: { type: 'boolean' },
-          aborted: { type: 'boolean' },
-          injectedAs: { type: 'string' },
-        },
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['exitCode', 'stdout', 'stderr', 'redacted', 'timedOut', 'aborted', 'injectedAs'],
+            properties: {
+              exitCode: { type: 'number' },
+              stdout: { type: 'string' },
+              stderr: { type: 'string' },
+              redacted: { type: 'boolean' },
+              timedOut: { type: 'boolean' },
+              aborted: { type: 'boolean' },
+              injectedAs: { type: 'string' },
+            },
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['status', 'ref'],
+            properties: {
+              status: { type: 'string', const: 'refused' },
+              ref: { type: 'string' },
+              note: { type: 'string' },
+            },
+          },
+        ],
       },
       render: (_args, value) => text(value),
     },

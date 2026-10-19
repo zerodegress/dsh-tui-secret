@@ -826,6 +826,10 @@ await check('㉝ a cancelled tool call settles the card and writes nothing', asy
   controller.abort()
   const result = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, { signal: controller.signal })
   assert(result.status === 'cancelled', `an aborted card was not cancelled: ${JSON.stringify(result)}`)
+  // The host rejects any tool result that is not losslessly JSON; an own `note: undefined`
+  // property is enough to turn a clean cancel into an INVALID_TOOL_OUTPUT error.
+  assert(!('note' in result), `the cancelled result kept the undefined note key: ${JSON.stringify(result)}`)
+  assert(Object.values(result).every((value) => value !== undefined), `the cancelled result carries undefined: ${JSON.stringify(result)}`)
   assert(!fs.existsSync(recordFile(home)) && !fs.existsSync(auditFile(home)), 'an aborted card wrote something')
 })
 
@@ -960,6 +964,62 @@ await check('㊴ a refusal note names the concrete reason only under DSH_TUI_SEC
   assert(notes.every((note) => !String(note).includes(SENTINEL)), `a refusal note carries a value: ${notes.join(' | ')}`)
   delete process.env.DSH_TUI_SECRET_DEBUG
 })
+
+// ---------------------------------------------------------------- declared output shapes
+// The host validates every tool result against its declared schema; a shape that only covers the
+// happy path turns each refusal into INVALID_TOOL_OUTPUT, so the note never reaches the model.
+await check('㊵ both tool outputs validate against their declared schema', async () => {
+  const candidates = []
+  if (process.env.DSH_PROFILE_DIR) {
+    candidates.push(path.join(process.env.DSH_PROFILE_DIR, 'node_modules/@deepseek-ai/dsh-tools/lib/types/json-schema.js'))
+  }
+  const pnpmRoot = path.join(os.homedir(), '.local/share/pnpm/global')
+  try {
+    for (const scope of fs.readdirSync(pnpmRoot)) {
+      for (const version of fs.readdirSync(path.join(pnpmRoot, scope))) {
+        const store = path.join(pnpmRoot, scope, version, 'node_modules/.pnpm')
+        let entries
+        try { entries = fs.readdirSync(store) } catch { continue }
+        for (const entry of entries) {
+          if (entry.startsWith('@deepseek-ai+dsh-tools@')) {
+            candidates.push(path.join(store, entry, 'node_modules/@deepseek-ai/dsh-tools/lib/types/json-schema.js'))
+          }
+        }
+      }
+    }
+  } catch {
+    // no pnpm global install on this machine
+  }
+  const file = candidates.find((candidate) => fs.existsSync(candidate))
+  if (!file) throw new Skip('no @deepseek-ai/dsh-tools on this machine, skipping the output-schema gate')
+  const { pathToFileURL } = await import('node:url')
+  const { assertSupportedJsonSchema, validateJsonSchemaValue } = await import(pathToFileURL(file).href)
+
+  freshTuiHome('schema')
+  const host = toolHost({ openResult: false })
+  apply(host.ctx)
+  const request = toolNamed(host.registered, 'request_credential')
+  const use = toolNamed(host.registered, 'use_credential')
+
+  const requestRefusal = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, {})
+  store.markStored('ALPHA_TOKEN', { scope: 'once' })
+  const useRefusal = await use.execute({ ref: 'NEVER_STORED', argv: ['true'] }, {})
+  const useSuccess = await use.execute({ ref: 'ALPHA_TOKEN', argv: ['echo', 'hi'] }, {})
+
+  const samples = {
+    request_credential: [requestRefusal, { status: 'stored', ref: 'ALPHA_TOKEN' }],
+    use_credential: [useRefusal, useSuccess],
+  }
+  for (const [name, values] of Object.entries(samples)) {
+    const tool = toolNamed(host.registered, name)
+    assertSupportedJsonSchema(tool.output.schema)
+    for (const value of values) {
+      const violations = validateJsonSchemaValue(tool.output.schema, value, 'value')
+      assert(violations.length === 0, `${name} returned a value its schema rejects: ${violations.join('; ')}`)
+    }
+  }
+})
+
 
 // ---------------------------------------------------------------- the declaration gate
 // The plugin declaration is consumed twice: the community parser validates its structure
