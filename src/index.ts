@@ -227,6 +227,28 @@ function failureLabel(error: unknown): string {
   return String(failure?.code || failure?.name || 'unknown')
 }
 
+/**
+ * `DSH_TUI_SECRET_DEBUG=1` adds the concrete reason to a refusal note ("the host did not open the
+ * scene", "the card was answered with refuse", …); the default wording is unchanged. Read per call,
+ * so a debug session can flip it without a restart. A reason never carries a value: the channel
+ * keeps reason codes only.
+ */
+function debugReasons(): boolean {
+  return process.env.DSH_TUI_SECRET_DEBUG === '1'
+}
+
+/**
+ * The note a model sees when `request_credential` stored nothing. `refused` keeps its default
+ * wording (the human's refusal and a card that could not be shown stay indistinguishable unless
+ * debug is on); `cancelled` carries a note only in debug mode.
+ */
+function noCardNote(channel: CardChannel, kind: 'stored' | 'cancelled' | 'refused'): string | undefined {
+  if (kind === 'stored') return undefined
+  if (kind === 'cancelled') return debugReasons() ? `the request was cancelled [${channel.lastRefusal() ?? 'no reason recorded'}]` : undefined
+  const base = 'the user refused, or no card could be shown'
+  return debugReasons() ? `${base} [${channel.lastRefusal() ?? 'no reason recorded'}]` : base
+}
+
 /** The tool result a model sees: a status, never a value. */
 function text(value: unknown): unknown[] {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
@@ -283,13 +305,36 @@ export function apply(ctx: Context, config?: Config): void {
     revokeEveryGrant: () => revokeAll(),
   })
 
-  seams.inject(['tuiScenes'], (sceneCtx) => {
-    const dispose = sceneCtx.tuiScenes!.register(
-      { id: SCENE_ID, title: options.title, component: scene },
-      ctx, // identity: the effect ledger's pluginId; omitting it records `undeclared` (C-060)
-    )
-    seams.effect(() => () => dispose())
-    logger.info(`scene ${SCENE_ID} registered`)
+  // Filled in by the scenes inject callback below: a registration that throws must not be swallowed
+  // (a silent failure is what made `/secrets` report "not registered" with no way to tell why).
+  let sceneFailure: string | undefined
+
+  seams.inject(['tuiScenes'], () => {
+    // Register through THIS context, not through the scoped context the callback receives:
+    // `ctx.inject()` starts a child activation (Cordis `Context.inject` is `plugin({inject,apply})`),
+    // and dsh-TUI records the registering activation per scene and refuses to open a scene from a
+    // different one ("scene ... belongs to another activation"). Registering as a child while the
+    // command and the card open the scene from the parent made `/secrets` fail with
+    // "the secrets scene is not registered". The inject callback is only how we wait for the
+    // service to be mounted; every call goes through the same context as `open` below.
+    const scenes = seams.get<ScenesRegisterSeam>('tuiScenes', false)
+    if (!scenes?.register) {
+      sceneFailure = 'noregister'
+      logger.warn('scene registration failed (noregister): the tuiScenes service has no register()')
+      return
+    }
+    try {
+      const dispose = scenes.register(
+        { id: SCENE_ID, title: options.title, component: scene },
+        ctx, // identity: the effect ledger's pluginId; both ctx and this access path are our activation
+      )
+      seams.effect(() => () => dispose())
+      logger.info(`scene ${SCENE_ID} registered`)
+    } catch (error) {
+      // Code/name only: an error's raw text may embed anything, and this line goes to the TUI log.
+      sceneFailure = failureLabel(error)
+      logger.warn(`scene registration failed (${sceneFailure}); /secrets cannot open`)
+    }
   })
 
   seams.inject(['commands'], (commandCtx) => {
@@ -302,9 +347,11 @@ export function apply(ctx: Context, config?: Config): void {
           return { kind: 'error', text: 'dsh-TUI provides no scene surface (tuiScenes), so /secrets cannot open' }
         }
         const opened = scenes.open(SCENE_ID)
-        return opened
-          ? { kind: 'success' }
-          : { kind: 'error', text: 'the secrets scene is not registered (the plugin may be disabled)' }
+        if (opened) return { kind: 'success' }
+        // The reason is for the human who typed the command, so it is always shown; it is a short
+        // code — never an error's raw text, which may embed anything.
+        const why = sceneFailure ? `registration failed: ${sceneFailure}` : 'the host does not have it in the scene registry'
+        return { kind: 'error', text: `the secrets scene is not registered (${why})` }
       },
     }
     let dispose: (() => void) | undefined
@@ -389,7 +436,7 @@ function requestCredentialTool(deps: ToolDeps): ToolDefinitionLike {
       if (outcome.kind !== 'stored') {
         // A refusal or a cancellation writes nothing at all — no record, no audit line.
         deps.logger.info(`${REQUEST_TOOL} ${ref}: ${outcome.kind}`)
-        return { status: outcome.kind, ref, note: outcome.kind === 'refused' ? 'the user refused, or no card could be shown' : undefined }
+        return { status: outcome.kind, ref, note: noCardNote(deps.channel, outcome.kind) }
       }
       markStored(ref, { scope: outcome.scope, purpose, sessionId })
       appendAudit({ event: 'request', ref, purpose, sessionId })

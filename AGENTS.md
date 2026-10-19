@@ -37,7 +37,7 @@ dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ```sh
 pnpm install    # 首次：装构建依赖（typescript / @types/node / @deepseek-ai/cordis）
 npm run compile # = 清 lib/ 再 tsc -p tsconfig.json：src/ → lib/types/
-npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㊳ 工具与权限表 + ⑳ 声明闸门，33/33 PASS 为通过
+npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㊴ 工具与权限表 + ⑳ 声明闸门，34/34 PASS 为通过
 npm run verify  # 同一入口
 npm run typecheck   # tsc --noEmit，静态关口
 npm pack --dry-run          # 检查发布内容（17 文件；npm 缓存不在工作区时加 npm_config_cache=<目录>）
@@ -61,7 +61,14 @@ dsh plugin --profile dsh-tui add <本仓路径>   # 本地试装（会动 profil
   拉起的子进程（变量名 `DSH_SECRET_<REF>`，由 `ctx.shell` 的 `spec.env` 传下去，`dshEnv` 不用）。
 - 场景面缺席时静默降级（什么都不注册），绝不拖垮 TUI 启动；接入面存在但用错时（如
   `open()` 返回 false）要**响亮报错**，不静默。
+- **场景的注册与打开必须来自同一个激活**：`ctx.inject(...)` 起的是子激活（Cordis 的
+  `Context.inject` 就是 `plugin({ inject, apply })`），而 dsh-TUI 按注册激活记录场景归属、拒绝
+  另一个激活的 `open()`（`scenes.js` 的 `openScene`：「belongs to another activation」）。所以
+  inject 只用来等 `tuiScenes` 挂载，**注册与打开都走插件自己的 ctx**（`ctx.get('tuiScenes', false)`）；
+  回归断言在 `⑨`。
 - 可选的宿主面一律 `ctx.get(name, false)` 软探测，不放进 `inject` 列表。
+- 调试只走 `DSH_TUI_SECRET_DEBUG=1`：`request_credential` 的拒绝 note 附上原因码（不含值）；
+  默认措辞不变，不把「人拒绝」与「卡片弹不出来」的差异暴露成可探测的侧信道。
 
 ## 约定与红线
 

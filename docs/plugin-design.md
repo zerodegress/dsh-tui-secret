@@ -39,6 +39,16 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 （剔除 `DEEPSEEK_*` / `DSH_*`）在 0.16.0 已经存在，但设置屏尚未把该字段渲染成掩码。
 所以「屏幕上不出现明文」这件事，v1 只能由自己渲染的**全屏场景**保证。
 
+**场景的注册与打开必须来自同一个激活。**
+dsh-TUI 按**注册时的激活**记录每个场景（`lib/types/dsh-adapter/scenes.js:102`
+`state.owners.set(id, activationOwner)`），`openScene` 在 `:174-177` 比对这个归属：不是
+同一个激活就 `warn("scene ... belongs to another activation")` 并返回 `false`。而 Cordis 的
+`ctx.inject(deps, cb)` 就是 `plugin({ inject, apply: cb })`（`@deepseek-ai/cordis` 的
+`Context.inject`），**会起一个子激活**。所以注册若发生在 inject 回调里、而命令与卡片从
+插件自己的 ctx 调 `open()`，两者激活不同，`/secrets` 必然打不开（现场表现就是
+「the secrets scene is not registered (the plugin may be disabled)」）。本插件的做法：
+inject 只用来等 `tuiScenes` 挂载，注册与打开**都走插件自己的 ctx**（回归断言见 `⑨`）。
+
 **凭据值不会自动进入模型 shell。**
 `ctx.credentials` 的消费者是「按 ref 取值的插件」（LLM key 那类）。核心不会把凭据值
 注入模型可执行的 shell，因此 v1 不注册 shellEnv 贡献者，也就不与其他插件的
@@ -50,7 +60,7 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 | --- | --- | --- |
 | 屏幕 | 在场的人、终端回滚缓冲、终端录像 | 掩码是**固定长度占位**：既不回显字符，也不透露长度 |
 | 会话转录 | 模型与所有历史读者 | 值不进任何会话事件；命令 handler 只返回静默 `success` |
-| 工具结果与工具卡 | 模型、落库的 `tool/result` | 不注册工具；不挂 `tools/execute` |
+| 工具结果与工具卡 | 模型、落库的 `tool/result` | 两个工具只回状态／exit code 与脱敏后的输出；值不经工具参数、不经结果 |
 | 模型请求 | 模型 | 不挂 `llm/stream` |
 | 日志与错误 | 日志读者 | 只记名字与错误 `code`，不记原始错误文本（可能夹带值） |
 | 凭据文件 | 同机用户 | 只要 provider 那一步：0600、目录 0700；文件本身永远是权威存储 |
@@ -117,8 +127,11 @@ merge（`dsh-bash-local` 的注释写明 trusted caller 的条目仍然生效）
 ## 消费面与脱敏
 
 写入只走凭据接缝，因此消费面就是接缝本身：任何按 ref 取值的插件都能用到，无需本插件
-再做一层。模型侧则**没有任何出口**——插件不注册工具、不挂模型相关的 cordis 事件，值
-既不会出现在工具结果里，也不会出现在发给模型的请求里。
+再做一层。模型侧**只有两个工具**（`request_credential` / `use_credential`）这一个入口：
+值不经工具参数、不经工具结果，`use_credential` 只把值放进那一次执行的子进程环境，输出里
+出现的值换成 `[credential]`。**不做假承诺**：脱敏只覆盖返回的那段文本，被变换或被输出上限
+截断的副本认不出（`redacted: false` 的含义是「返回的这段里没检测到」）；凭据库本身是明文，
+有 `bash` 的 agent 直接读文件也能拿到——那条不在本插件的闸门里。
 
 会话遥测（若有）属于另一条链路（`dsh-session-telemetry` 的 `session-telemetry/record`
 waterfall），本插件不写遥测，因此不需要在那里挂脱敏规则。
@@ -135,11 +148,16 @@ TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编�
 - **引号与 shell 边界层**（`⑬–⑮`）：把插件拼出来的命令串真的交给 `/bin/sh` 跑 —— 恶意
   `argv`（`;`、`$()`、反引号、引号、换行、空串）必须原样当数据到达；值只在模型**自己写的**
   `["sh","-c","…"]` 里展开，且展开后的输出照样被换成 `[credential]`。
-- **工具与权限层**（`㉑–㉟`）：用假宿主驱动两个工具 —— 运行期注册、未授权即拒绝且不启动命令、
+- **工具与权限层**（`㉑–㊴`）：用假宿主驱动两个工具 —— 运行期注册、未授权即拒绝且不启动命令、
   值只进那一次执行的 `spec.env`（父进程环境逐字节不变）、四个 scope 的入口判定、`once` 用后即撤、
   `until` 到期、`session` 按 session id 且不自动清、审计无值、拒绝/取消零写入、v1 记录兼容、
   `v` / `R` 撤销、没有 shell 面与没有 TUI 前台时的降级、卡片来回（选 scope → 掩码输入 → 落存储，
-  settle 里不含值）。
+  settle 里不含值）、脱敏的两条诚实边界（编码副本、被上限截断的半值）、短值的代价，以及
+  拒绝 note 的原因码（仅 `DSH_TUI_SECRET_DEBUG=1` 时附上，默认措辞不变、永远不含值）。
+
+调试：`DSH_TUI_SECRET_DEBUG=1 dsh` 让 `request_credential` 的 note 带上具体原因
+（`the host did not open the scene` / `the card was answered with refuse` / `the tool call was aborted` …）。
+默认不区分「人拒绝」与「卡片弹不出来」，是为了不让失败原因变成可探测的侧信道。
 
 它不覆盖真机 TTY 的回滚缓冲与终端录像，也覆盖不到终端之外的写入方（Web 卡片、`dsh`
 自己写同一份凭据文件）；这些需要真实终端手测。

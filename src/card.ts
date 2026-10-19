@@ -30,6 +30,11 @@ export interface CardChannel {
   settle(outcome: CardOutcome): boolean
   /** Subscribe to "a card appeared or went away" so the scene can repaint. */
   subscribe(listener: () => void): () => void
+  /**
+   * Why the last request produced no card, as a short reason code, or nothing when a card was
+   * answered by a human. Never contains a value: only the tool's debug note reads this.
+   */
+  lastRefusal(): string | undefined
 }
 
 /** The only scene seam we need. */
@@ -54,12 +59,17 @@ export class RefusingChannel implements CardChannel {
   subscribe(): () => void {
     return () => {}
   }
+
+  lastRefusal(): string | undefined {
+    return 'no scene surface is mounted'
+  }
 }
 
 /** Our own card: pending slot + scene repaint notifications. */
 export class SceneChannel implements CardChannel {
   private pending: { input: CardRequest; resolve: (outcome: CardOutcome) => void } | null = null
   private readonly listeners = new Set<() => void>()
+  private refusal: string | undefined
 
   constructor(
     private readonly scenes: ScenesSeam,
@@ -76,30 +86,44 @@ export class SceneChannel implements CardChannel {
     return () => { this.listeners.delete(listener) }
   }
 
+  lastRefusal(): string | undefined {
+    return this.refusal
+  }
+
   settle(outcome: CardOutcome): boolean {
     const pending = this.pending
     if (!pending) return false
     this.pending = null
+    this.refusal = outcome.kind === 'refused' ? 'the card was answered with refuse'
+      : outcome.kind === 'cancelled' ? 'the card was cancelled'
+        : undefined
     pending.resolve(outcome)
     this.notify()
     return true
   }
 
   request(input: CardRequest, options: { signal?: AbortSignal } = {}): Promise<CardOutcome> {
+    this.refusal = undefined
     if (this.pending) {
       // Fail-closed rather than queue: two cards at once would make "which answer is whose"
       // ambiguous, and a queue would hold a live promise past the caller's patience.
       this.logger?.warn(`a card for ${this.pending.input.ref} is already open; refusing ${input.ref}`)
+      this.refusal = `a card for ${this.pending.input.ref} is already open`
       return Promise.resolve({ kind: 'refused' })
     }
     const signal = options.signal
-    if (signal?.aborted) return Promise.resolve({ kind: 'cancelled' })
+    if (signal?.aborted) {
+      this.refusal = 'the tool call was already aborted'
+      return Promise.resolve({ kind: 'cancelled' })
+    }
 
     return new Promise<CardOutcome>((resolve) => {
       this.pending = { input, resolve }
       if (!this.scenes.open(this.sceneId)) {
-        // No TUI front end (headless / web): never report success, and clear the slot.
+        // No TUI front end (headless / web), or a scene this activation may not open: never report
+        // success, and clear the slot.
         this.pending = null
+        this.refusal = 'the host did not open the scene'
         this.logger?.warn('no TUI front end accepted the scene; the request is refused')
         resolve({ kind: 'refused' })
         return
@@ -107,6 +131,7 @@ export class SceneChannel implements CardChannel {
       signal?.addEventListener('abort', () => {
         const dropped = this.pending
         this.pending = null
+        this.refusal = 'the tool call was aborted'
         this.notify()
         dropped?.resolve({ kind: 'cancelled' })
       }, { once: true })

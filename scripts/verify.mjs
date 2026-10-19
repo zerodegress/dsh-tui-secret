@@ -301,9 +301,9 @@ await check('⑧ a failed write reports the error code only, never the value or 
 
 // ---------------------------------------------------------------- mounting surface: no model-facing exit
 await check('⑨ apply touches two seams only and mounts no model-facing hook', async () => {
-  const calls = { inject: [], on: [], once: [], effect: 0 }
+  const calls = { inject: [], on: [], once: [], effect: 0, logs: [] }
   const fakeCtx = {
-    logger: { info: () => {}, warn: () => {} },
+    logger: { info: (line) => calls.logs.push(line), warn: (line) => calls.logs.push(line) },
     inject: (services, cb) => { calls.inject.push({ services, cb }) },
     on: (event, cb) => { calls.on.push({ event, cb }) },
     once: (event, cb) => { calls.once.push({ event, cb }) },
@@ -318,12 +318,20 @@ await check('⑨ apply touches two seams only and mounts no model-facing hook', 
   assert(calls.on.length === 0, `${calls.on.length} cordis events were mounted (a model-facing exit): ${calls.on.map((e) => e.event).join(',')}`)
   assert(calls.once.length === 0, `${calls.once.length} once-listeners were mounted`)
 
+  // The scene must be registered through the plugin's own context, never through the activation the
+  // inject callback receives: dsh-TUI records the registering activation per scene and refuses an
+  // open() from a different one (`scenes.js`: openScene → "belongs to another activation"). A scoped
+  // seam that gets used here is exactly the bug that made `/secrets` report "not registered".
   const registered = []
-  calls.inject.find((entry) => entry.services.includes('tuiScenes')).cb({
-    tuiScenes: { register: (descriptor, identity) => { registered.push({ descriptor, identity }); return () => {} } },
-  })
+  let scopedSeamUsed = 0
+  fakeCtx.get = (service) => (service === 'tuiScenes'
+    ? { register: (descriptor, identity) => { registered.push({ descriptor, identity }); return () => {} } }
+    : undefined)
+  const scopedSeam = { register: () => { scopedSeamUsed += 1; return () => {} }, open: () => true }
+  calls.inject.find((entry) => entry.services.includes('tuiScenes')).cb({ tuiScenes: scopedSeam })
   assert(calls.effect >= 1, `no cleanup was mounted after the scene registration (ctx.effect ${calls.effect})`)
   assert(registered.length === 1, 'the scene was not registered')
+  assert(scopedSeamUsed === 0, 'the scene was registered through the inject child activation: dsh-TUI then refuses open() from the parent')
   assert(registered[0].descriptor.id === 'secrets', `the scene id is not secrets: ${registered[0].descriptor.id}`)
   assert(typeof registered[0].descriptor.component === 'function', 'the scene has no component')
   assert(registered[0].identity === fakeCtx, 'register was not given the identity (the effect ledger would record undeclared)')
@@ -369,6 +377,41 @@ await check('⑨ apply touches two seams only and mounts no model-facing hook', 
   assert(opened[0] === 'secrets', `open was given the wrong id: ${opened[0]}`)
   fakeCtx.get = () => ({ open: () => false })
   assert(definition.handler().kind === 'error', 'an open() returning false produced no error')
+
+  // A registration that throws must be reported, not swallowed — a silent failure is what left
+  // `/secrets` saying "not registered" with no way to tell why.
+  const refused = new Error('registration refused by the host')
+  refused.code = 'COMPONENT_NOT_ADMITTED'
+  fakeCtx.get = (service) => (service === 'tuiScenes' ? { register: () => { throw refused } } : undefined)
+  calls.logs.length = 0
+  calls.inject.find((entry) => entry.services.includes('tuiScenes')).cb({ tuiScenes: scopedSeam })
+  assert(calls.logs.some((line) => line.includes('scene registration failed (COMPONENT_NOT_ADMITTED)')), `the registration failure was swallowed: ${calls.logs.join(' | ')}`)
+  assert(calls.logs.every((line) => !line.includes('registration refused by the host')), 'the raw error text reached the log')
+  fakeCtx.get = () => ({ open: () => false })
+  const why = definition.handler()
+  assert(why.kind === 'error' && why.text.includes('COMPONENT_NOT_ADMITTED'), `the command does not say why it cannot open: ${JSON.stringify(why)}`)
+
+  // A host model with the owner check that broke us for real: dsh-TUI records the registering
+  // activation (scenes.js:102) and refuses an open from another one (:129 → :173-176). `ctx.inject`
+  // starts a child activation, so a scene registered through the callback's scoped context is
+  // unopenable from the plugin's own context — this model makes that regression fail here.
+  const owners = new Map()
+  const parentSeam = { register: (d) => { owners.set(d.id, 'parent'); return () => {} }, open: (id) => owners.get(id) === 'parent' }
+  const childSeam = { register: (d) => { owners.set(d.id, 'child'); return () => {} }, open: (id) => owners.get(id) === 'child' }
+  const injections = []
+  const ownerCtx = {
+    logger: { info: () => {}, warn: () => {} },
+    inject: (services, cb) => { injections.push({ services, cb }) },
+    effect: () => {},
+    get: (name) => (name === 'tuiScenes' ? parentSeam
+      : name === 'tools' ? { register: () => () => {} }
+        : name === 'commands' ? { register: () => () => {} }
+          : undefined),
+  }
+  plugin.apply(ownerCtx)
+  injections.find((entry) => entry.services.includes('tuiScenes')).cb({ tuiScenes: childSeam })
+  assert(owners.get('secrets') === 'parent', `the scene was registered by the injected child activation, which can never open it: ${owners.get('secrets')}`)
+  assert(parentSeam.open('secrets') === true, 'the activation that registered the scene cannot open it')
 })
 
 // ---------------------------------------------------------------- the name index
@@ -891,6 +934,40 @@ await check('㊳ redaction replaces every occurrence — short values make outpu
   // re-substituted — unlike a loop-based scrubber, which yields `[[credential]]`.
   assert(redact('the value is credential', 'credential').text === 'the value is [credential]', 'the single-pass placeholder case changed')
   assert(redact('nothing here', 'abc123').text === 'nothing here', 'a miss must not touch the text')
+})
+
+// ---------------------------------------------------------------- the refusal note
+await check('㊴ a refusal note names the concrete reason only under DSH_TUI_SECRET_DEBUG=1', async () => {
+  const base = 'the user refused, or no card could be shown'
+  delete process.env.DSH_TUI_SECRET_DEBUG
+  const off = toolHost({ openResult: false })
+  apply(off.ctx)
+  const plain = await toolNamed(off.registered, 'request_credential').execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, {})
+  assert(plain.status === 'refused', `a scene that will not open must refuse: ${JSON.stringify(plain)}`)
+  assert(plain.note === base, `the default note changed: ${JSON.stringify(plain.note)}`)
+
+  process.env.DSH_TUI_SECRET_DEBUG = '1'
+  const on = toolHost({ openResult: false })
+  apply(on.ctx)
+  const debug = await toolNamed(on.registered, 'request_credential').execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, {})
+  assert(debug.note.startsWith(base), `the debug note lost the default wording: ${JSON.stringify(debug.note)}`)
+  assert(debug.note.endsWith('[the host did not open the scene]'), `the debug note misses the reason: ${JSON.stringify(debug.note)}`)
+
+  // The prose is only as good as the channel's reason codes; both real endings are pinned here.
+  const { SceneChannel } = await import('../lib/types/card.js')
+  const shown = new SceneChannel({ open: () => true }, 'secrets')
+  const answered = shown.request({ ref: 'ALPHA_TOKEN', purpose: 'x' })
+  assert(shown.lastRefusal() === undefined, 'a card that is on screen must not report a reason')
+  shown.settle({ kind: 'refused' })
+  assert((await answered).kind === 'refused', 'the card did not settle as refused')
+  assert(shown.lastRefusal() === 'the card was answered with refuse', `wrong reason after a human refusal: ${shown.lastRefusal()}`)
+  const blind = new SceneChannel({ open: () => false }, 'secrets')
+  assert((await blind.request({ ref: 'ALPHA_TOKEN', purpose: 'x' })).kind === 'refused', 'an unopenable scene did not refuse')
+  assert(blind.lastRefusal() === 'the host did not open the scene', `wrong reason when the scene will not open: ${blind.lastRefusal()}`)
+
+  const notes = [plain.note, debug.note, shown.lastRefusal(), blind.lastRefusal()]
+  assert(notes.every((note) => !String(note).includes(SENTINEL)), `a refusal note carries a value: ${notes.join(' | ')}`)
+  delete process.env.DSH_TUI_SECRET_DEBUG
 })
 
 // ---------------------------------------------------------------- the declaration gate
