@@ -300,27 +300,49 @@ await check('⑧ a failed write reports the error code only, never the value or 
 })
 
 // ---------------------------------------------------------------- mounting surface: no model-facing exit
-await check('⑨ apply touches two seams only and mounts no model-facing hook', async () => {
+await check('⑨ apply mounts no model-facing hook; the scene registers on first use', async () => {
   const calls = { inject: [], on: [], once: [], effect: 0, logs: [] }
+  // The real dsh-TUI rule (scenes.js → host-access.js): `tuiScenes.register/open` accept a call
+  // only from an activation the host's fiber instrumentation has already recorded. That is false
+  // while `apply()` runs (the fiber is still loading) and false inside a `ctx.inject()` callback
+  // (the ambient activation is the child's while the call goes through the parent ctx): both throw
+  // "requires a live Cordis activation context". Registering there is the bug that left `/secrets`
+  // unregistered and made every card `refused`. The seam below refuses until `admissible` flips, so
+  // a regression to registering during apply (or inside the inject callback) fails this check.
+  let admissible = false
+  const owners = new Map()
+  const registered = []
+  let openCalls = 0
+  const seam = {
+    register: (descriptor, identity) => {
+      if (!admissible) throw new Error('dsh-tui: tuiScenes.register requires a live Cordis activation context')
+      assert(identity === fakeCtx, 'register was not given this plugin ctx (the effect ledger would record undeclared)')
+      registered.push(descriptor)
+      owners.set(descriptor.id, 'ours')
+      return () => owners.delete(descriptor.id)
+    },
+    open: (id) => {
+      if (!admissible) throw new Error('dsh-tui: tuiScenes.open requires a live Cordis activation context')
+      openCalls += 1
+      return owners.get(id) === 'ours'
+    },
+  }
   const fakeCtx = {
     logger: { info: (line) => calls.logs.push(line), warn: (line) => calls.logs.push(line) },
     inject: (services, cb) => { calls.inject.push({ services, cb }) },
     on: (event, cb) => { calls.on.push({ event, cb }) },
     once: (event, cb) => { calls.once.push({ event, cb }) },
     effect: () => { calls.effect += 1 },
-    get: () => undefined,
+    get: (name) => (name === 'tuiScenes' ? seam : undefined),
   }
   plugin.apply(fakeCtx)
 
   const services = calls.inject.map((entry) => entry.services.join(','))
+  assert(!services.includes('tuiScenes'), `tuiScenes was still awaited during apply: ${services.join('|')}`)
   assert(services.includes('commands'), `commands was not mounted: ${services.join('|')}`)
-  // tuiScenes must NOT be injected: `ctx.inject` runs its callback under the child activation it
-  // starts, and dsh-TUI validates the ambient activation (host-access.js: assertion "stale
-  // activation") while recording the registering activation per scene. Registration is lazy instead.
-  assert(!services.includes('tuiScenes'), `tuiScenes must not be injected (its callback runs under a child activation): ${services.join('|')}`)
   assert(calls.on.length === 0, `${calls.on.length} cordis events were mounted (a model-facing exit): ${calls.on.map((e) => e.event).join(',')}`)
   assert(calls.once.length === 0, `${calls.once.length} once-listeners were mounted`)
-  assert(calls.logs.every((line) => !line.includes('scene secrets registered')), `the scene was registered during apply: ${calls.logs.join(' | ')}`)
+  assert(registered.length === 0 && openCalls === 0, 'apply touched the scene registry before anything needed it')
 
   // Command surface: the mediated surface comes first (with attribution); absent or refusing
   // surfaces fall back to a direct registration.
@@ -348,59 +370,53 @@ await check('⑨ apply touches two seams only and mounts no model-facing hook', 
   assert(definition?.name === 'secrets', `the command name is not secrets: ${definition?.name}`)
   assert(!JSON.stringify(definition.description).includes(SENTINEL), 'the command description holds the sentinel')
 
-  // With no scene surface: fail loudly rather than silently, and register nothing.
+  // With no scene surface: fail loudly rather than silently.
   fakeCtx.get = () => undefined
   const noScene = definition.handler()
   assert(noScene.kind === 'error', `no error when the scene surface is missing: ${JSON.stringify(noScene)}`)
   assert(noScene.text.includes('tuiScenes'), `the error does not say what is missing: ${noScene.text}`)
-  assert(calls.logs.every((line) => !line.includes('scene secrets registered')), 'the scene was registered without a service')
 
-  // The host model that matters: dsh-TUI records the registering activation (scenes.js:102) and
-  // refuses an open from any other one (:129 → :173-176). Registration happens on first use, on this
-  // plugin's own activation; a scene registered under the activation `ctx.inject` starts is
-  // unopenable from here, so this model makes that regression fail.
-  const owners = new Map()
-  const opened = []
-  let identity = null
-  const parentSeam = {
-    register: (descriptor, who) => { owners.set(descriptor.id, 'parent'); identity = who; return () => {} },
-    open: (id) => { opened.push(id); return owners.get(id) === 'parent' },
-  }
-  const childSeam = { register: (d) => { owners.set(d.id, 'child'); return () => {} }, open: (id) => owners.get(id) === 'child' }
-  fakeCtx.get = (service) => (service === 'tuiScenes' ? parentSeam : undefined)
+  // First use (the command) registers the scene and then opens it; the success stays silent.
+  admissible = true
+  fakeCtx.get = (service) => (service === 'tuiScenes' ? seam : undefined)
   const ok = definition.handler()
-  assert(ok.kind === 'success' && Object.keys(ok).length === 1, `the happy path did not return a silent success: ${JSON.stringify(ok)}`)
-  assert(owners.get('secrets') === 'parent', `the scene was registered by another activation: ${owners.get('secrets')}`)
-  assert(identity === fakeCtx, 'register was not given the identity (the effect ledger would record undeclared)')
-  assert(opened[0] === 'secrets', `open was given the wrong id: ${opened[0]}`)
-  assert(parentSeam.open('secrets') === true, 'the activation that registered the scene cannot open it')
-  assert(childSeam.open('secrets') === false, 'the model host does not model an owner mismatch')
-  assert(calls.logs.some((line) => line.includes('scene secrets registered')), `the success line discriminates a thrown registration in the log: ${calls.logs.join(' | ')}`)
+  assert(ok.kind === 'success', `the happy path did not return a silent success: ${JSON.stringify(ok)}`)
+  assert(Object.keys(ok).length === 1, `the success result carries content: ${JSON.stringify(ok)}`)
+  assert(registered.length === 1 && registered[0].id === 'secrets', 'the command did not register the scene on first use')
+  assert(typeof registered[0].component === 'function', 'the scene has no component')
+  assert(calls.effect >= 2, `no cleanup was mounted after the scene registration (ctx.effect ${calls.effect})`)
+  assert(openCalls === 1, `open was not called once after registration: ${openCalls}`)
 
-  // A second open must not register again (dsh-TUI throws on a duplicate id).
-  const again = definition.handler()
-  assert(again.kind === 'success' && owners.size === 1, `the scene was registered twice: ${owners.size}`)
+  // A second use opens without registering again.
+  definition.handler()
+  assert(registered.length === 1, 'the scene was registered twice')
+  assert(openCalls === 2, `the scene was not opened again: ${openCalls}`)
+
+  // An open() that returns false is an error, never a silent success.
+  owners.clear()
+  assert(definition.handler().kind === 'error', 'an open() returning false produced no error')
 
   // A registration that throws must be reported, not swallowed — a silent failure is what left
-  // `/secrets` saying "not registered" with no way to tell why. Fresh instance: this one has not
-  // registered yet.
+  // `/secrets` saying "not registered" with no way to tell why.
   const refused = new Error('registration refused by the host')
   refused.code = 'COMPONENT_NOT_ADMITTED'
-  const refusedLogs = []
-  let refusedHandler
-  const throwingCtx = {
-    logger: { info: (line) => refusedLogs.push(line), warn: (line) => refusedLogs.push(line) },
-    inject: (services, cb) => {
-      if (services.includes('commands')) cb({ commands: { register: (def) => { refusedHandler = def.handler; return () => {} } } })
-    },
+  const failLogs = []
+  const failInjections = []
+  let failedDefinition
+  const failCtx = {
+    logger: { info: (line) => failLogs.push(line), warn: (line) => failLogs.push(line) },
+    inject: (services, cb) => { failInjections.push({ services, cb }) },
     effect: () => {},
     get: (name) => (name === 'tuiScenes' ? { register: () => { throw refused }, open: () => false } : undefined),
   }
-  plugin.apply(throwingCtx)
-  const why = refusedHandler()
-  assert(refusedLogs.some((line) => line.includes('scene registration failed (COMPONENT_NOT_ADMITTED)')), `the registration failure was swallowed: ${refusedLogs.join(' | ')}`)
-  assert(refusedLogs.every((line) => !line.includes('registration refused by the host')), 'the raw error text reached the log')
+  plugin.apply(failCtx)
+  failInjections.find((entry) => entry.services.includes('commands')).cb({
+    commands: { register: (def) => { failedDefinition = def; return () => {} } },
+  })
+  const why = failedDefinition.handler()
   assert(why.kind === 'error' && why.text.includes('COMPONENT_NOT_ADMITTED'), `the command does not say why it cannot open: ${JSON.stringify(why)}`)
+  assert(failLogs.some((line) => line.includes('scene registration failed (COMPONENT_NOT_ADMITTED)')), `the registration failure was swallowed: ${failLogs.join(' | ')}`)
+  assert(failLogs.every((line) => !line.includes('registration refused by the host')), 'the raw error text reached the log')
 })
 
 // ---------------------------------------------------------------- the name index
@@ -804,17 +820,16 @@ await check('㉛ without a shell seam the tool refuses instead of throwing', asy
   assert(result.note.includes('shell'), `the note does not say why: ${result.note}`)
 })
 
-await check('㉜ the scene refuses a request when no TUI front end accepts it', async () => {
+await check('㉜ the scene registers on first use and a request is refused when the host will not open it', async () => {
   freshTuiHome('headless')
   const host = toolHost({ openResult: false })
   apply(host.ctx)
-  assert(host.registered.scenes.length === 0, 'the scene was registered before anything needed it')
+  assert(host.registered.scenes.length === 0, 'apply registered the scene before anything needed it')
   const request = toolNamed(host.registered, 'request_credential')
   const result = await request.execute({ ref: 'ALPHA_TOKEN', purpose: 'x' }, {})
   assert(result.status === 'refused', `a headless card was not refused: ${JSON.stringify(result)}`)
-  const scene = host.registered.scenes[0]
-  assert(scene && scene.id === 'secrets', 'the scene was not registered on first use')
-  assert(host.registered.scenes.length === 1, `the scene was registered ${host.registered.scenes.length} times`)
+  assert(host.registered.scenes.length === 1 && host.registered.scenes[0].id === 'secrets',
+    'the card did not register the scene on first use')
 })
 
 await check('㉝ a cancelled tool call settles the card and writes nothing', async () => {

@@ -14,7 +14,7 @@
 非目标：不自建凭据存储；不做系统 keyring；不把值注入模型可执行的环境；不向上游提交
 补丁（等 dsh-TUI 的设置区块自己渲染掩码后，本插件的场景可以退化成纯列表管理）。
 
-## 事实基线（DSH 0.2.1-alpha.1 与 dsh-TUI 0.16.x 实读）
+## 事实基线（DSH 0.2.1-rc.2 与 dsh-TUI 0.16.1 实读/实跑）
 
 **凭据接缝只有四个操作，且没有枚举。**
 `@deepseek-ai/dsh-credentials/lib/types/index.d.ts:56/63/72/79` 定义
@@ -39,17 +39,22 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 （剔除 `DEEPSEEK_*` / `DSH_*`）在 0.16.0 已经存在，但设置屏尚未把该字段渲染成掩码。
 所以「屏幕上不出现明文」这件事，v1 只能由自己渲染的**全屏场景**保证。
 
-**场景在首次使用时注册，不在 `inject` 回调里碰宿主面（实测）。**
-宿主只接受「**当前正在执行的那个激活**」发出的 service 调用：`host-access.js` 的 `runActivation`
-把激活令牌挂到执行环境上，`assertLiveContext` 见到不属于被调 ctx 的令牌就按 stale activation 拒
-（对 `requirePluginCaller` 报 `requires a live Cordis activation context`）。`ctx.inject(deps, cb)`
-的回调跑在它新建的**子激活**下，因此：回调里用**父** ctx 调 ⇒ 抛（拿真宿主与线上同一 cordis
-实测）；用**子**激活的服务调 ⇒ 过，但归属记成子激活（`scenes.js:102`
-`state.owners.set(id, activationOwner)`），之后 `openScene` 在 `:174-177` 比对归属不等 ⇒ `false`
-（「belongs to another activation」）。`apply` 期注册本身是合法的（`assertLiveContext` 放行
-LOADING=1 与 ACTIVE=2，实测也过），本插件仍选**惰性注册**：命令与卡片本来就在自己的激活上，
-顺手在那里 `register` 一次再 `open`，并把注册/打开的失败原因（短码）打进日志与 `/secrets`
-文案 —— 最早那次静默失败正是「not registered」查不下去的原因。
+**场景必须在激活就绪之后注册，`apply` 与 `inject` 回调里都不行。**
+dsh-TUI 的 `tuiScenes.register/open` 只接受**已被 fiber 插桩记录**的激活
+（`lib/types/dsh-adapter/host-access.js` 的 `assertLiveContext` → `trustedFibers` / `canonicalContexts`），
+否则抛 `dsh-tui: tuiScenes.register requires a live Cordis activation context`。两个「自然」位置
+都不满足：
+
+- `apply()` 期间 fiber 仍在加载。实测（真 `scenes.js` + Cordis 4.0.5 的最小复现）：apply 回调里
+  `activationFiber(ctx)` 返回 `undefined`，同一个 ctx 在 `setTimeout` 之后才返回 fiber。
+- `ctx.inject(deps, cb)` 的回调跑在**子激活**的 ambient token 下；即使注册故意走父 ctx
+  （`ctx.get('tuiScenes').register(..., ctx)`），token 与调用者 fiber 对不上，仍然抛同一句。
+  用回调收到的子 ctx 注册能成功，但之后从父 ctx `open()` 会因归属不同而 `false`。
+
+所以本插件在**第一次真正要开场景时**注册（`/secrets` 命令 handler 或卡片请求），注册与打开
+走同一个插件 ctx（`ensureScene()` / `openScene()`）。现场表现：注册若发生在 apply / inject 回调，
+`/secrets` 报「the secrets scene is not registered (registration failed: Error)」，而
+`request_credential` 每次都立刻 `refused`（`open()` 拿不到场景）。回归断言见 `⑨`、`㉜`。
 
 **凭据值不会自动进入模型 shell。**
 `ctx.credentials` 的消费者是「按 ref 取值的插件」（LLM key 那类）。核心不会把凭据值

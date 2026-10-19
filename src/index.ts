@@ -288,20 +288,18 @@ export function apply(ctx: Context, config?: Config): void {
   const getCredentials = (): CredentialsSeam | undefined => seams.get<CredentialsSeam>('credentials', false) ?? seams.credentials
   const getShell = (): ShellSeam | undefined => seams.get<ShellSeam>('shell', false) ?? seams.shell
 
-  // The scene is registered on first use — never inside an inject callback. dsh-TUI only accepts a
-  // service call from the activation that is currently executing (`host-access.js` `runActivation`
-  // tags the ambient activation; a call from another one is a "stale activation", surfaced as
-  // "requires a live Cordis activation context"), and `ctx.inject()` runs its callback under the
-  // child activation it starts — so registering through the *parent* context there throws (measured
-  // against the real host). Registering through the child's own service passes but records the child
-  // as the scene's owner, and dsh-TUI then refuses to open it from here (`scenes.js` openScene:
-  // "belongs to another activation"). Registering during `apply` would be allowed (LOADING is
-  // accepted), but the command handler and the card already run on our own activation, so they
-  // register once, on first use, and open right after.
+  // The scene is registered on first use, never during `apply` and never inside an inject callback.
+  // dsh-TUI's `tuiScenes` accepts a call only from an activation its fiber instrumentation has
+  // already recorded. Neither place qualifies: `apply` still runs while the fiber is loading, and a
+  // `ctx.inject()` callback runs under the child's ambient activation while this registration goes
+  // through the parent ctx. Both throw
+  //   "dsh-tui: tuiScenes.register requires a live Cordis activation context".
+  // The command handler and the card run later, on our own activation, so they register the scene
+  // first and open it immediately. `sceneFailure` keeps why a registration/open did not happen — a
+  // silent failure is what made `/secrets` report "not registered" with no way to tell why.
   let sceneRegistered = false
   let sceneFailure: { stage: 'registration' | 'open'; code: string } | undefined
 
-  /** Register the scene once, on our own activation; returns the seam to open it through. */
   const ensureScene = (): ScenesRegisterSeam | undefined => {
     const scenes = seams.get<ScenesRegisterSeam>('tuiScenes', false)
     if (!scenes?.register) {
@@ -327,7 +325,7 @@ export function apply(ctx: Context, config?: Config): void {
     return scenes
   }
 
-  /** Register the scene if needed and open it. False means it cannot be shown; `sceneFailure` says why. */
+  /** Register (once) and open the scene. A false return always leaves a reason in `sceneFailure`. */
   const openScene = (): boolean => {
     const scenes = ensureScene()
     if (!scenes?.open) return false
@@ -362,12 +360,17 @@ export function apply(ctx: Context, config?: Config): void {
       name: options.entryCommand,
       description: 'Enter, list or delete secrets (values are never echoed and never reach the conversation)',
       handler: (): CommandResult => {
+        const scenes = seams.get<ScenesRegisterSeam>('tuiScenes', false)
+        if (!scenes?.open) {
+          return { kind: 'error', text: 'dsh-TUI provides no scene surface (tuiScenes), so /secrets cannot open' }
+        }
+        // Registering happens here, on this activation, not in apply: see `ensureScene`.
         if (openScene()) return { kind: 'success' }
         // The reason is for the human who typed the command, so it is always shown; it is a short
-        // code, never an error's raw text (which may embed anything).
-        const why = sceneFailure === undefined ? 'the host did not open it'
-          : sceneFailure.code === 'noregister' ? 'dsh-TUI provides no scene surface (tuiScenes)'
-            : `${sceneFailure.stage} failed: ${sceneFailure.code}`
+        // code — never an error's raw text, which may embed anything.
+        const why = sceneFailure
+          ? `${sceneFailure.stage} failed: ${sceneFailure.code}`
+          : 'the host does not have it in the scene registry'
         return { kind: 'error', text: `the secrets scene is not registered (${why})` }
       },
     }

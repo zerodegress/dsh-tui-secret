@@ -151,14 +151,16 @@ npm test        # = npm run compile && node scripts/verify.mjs
 npm 包发的也是它。`lib/` 是产物、不进 git。
 
 脚本覆盖三层加一道闸门：`①–⑫` 场景（哨兵验证，含真 ink 渲染）、`⑬–⑮` 引号与 shell 边界
-（跑真 `/bin/sh`）、`㉑–㊴` 两个工具与权限表（注册、拒绝、四个 scope、审计、脱敏的两条诚实边界、撤销、降级、卡片来回、
-拒绝 note 的原因码）、
+（跑真 `/bin/sh`）、`㉑–㊵` 两个工具与权限表（注册、拒绝、四个 scope、审计、脱敏的两条诚实边界、撤销、降级、卡片来回、
+拒绝 note 的原因码、两个工具的返回值用宿主自己的校验器过一遍声明的 schema）、
 `⑳` 插件声明 —— 用宿主自己的 `@dsh-std/manifest` 解析器与 TUI profile 校验器离线跑一遍，
 manifest 一漂当场就红。
 
-**排障**：`/secrets` 报「the secrets scene is not registered」时，括号里带短原因码 ——
-`registration failed: <code>`（注册那一步抛了，日志里也有同一句，只记 code/name 不记原始文本）、
-`open failed: <code>`，或 `the host did not open it`。卡片总是 `refused` 时，用
+**排障**：场景是**第一次使用时**才注册的（启动时不注册）—— dsh-TUI 只接受来自「已被 fiber 插桩
+记录」的激活的 `tuiScenes` 调用，而 `apply` 与 `inject` 回调都跑在别的 ambient 激活下。
+`/secrets` 报「the secrets scene is not registered」时，括号里带短原因码 ——
+`registration failed: <code>`（注册那一步抛了，日志里也有同一句，只记 code/name 不记原始文本）
+或 `open failed: <code>`。卡片总是 `refused` 时，用
 `DSH_TUI_SECRET_DEBUG=1` 起 TUI —— `request_credential` 的 note 会附上具体原因
 （`the host did not open the scene`、`the card was answered with refuse`、`the tool call was aborted`…），
 里面永远没有值。默认不区分「人拒绝」与「卡片弹不出来」，以免失败原因变成可探测的侧信道。

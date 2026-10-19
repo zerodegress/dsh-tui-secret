@@ -61,13 +61,12 @@ dsh plugin --profile dsh-tui add <本仓路径>   # 本地试装（会动 profil
   拉起的子进程（变量名 `DSH_SECRET_<REF>`，由 `ctx.shell` 的 `spec.env` 传下去，`dshEnv` 不用）。
 - 场景面缺席时静默降级（什么都不注册），绝不拖垮 TUI 启动；接入面存在但用错时（如
   `open()` 返回 false）要**响亮报错**，不静默。
-- **场景在首次使用时注册，不在 `inject` 回调里碰宿主面**：dsh-TUI 只接受「**当前正在执行的那个
-  激活**」发出的 service 调用（`host-access.js` 的 `runActivation` 给环境挂激活令牌，别的激活来调
-  一律按 stale activation 拒，最终报 `requires a live Cordis activation context`），而 `ctx.inject`
-  的回调跑在它新建的**子激活**下 —— 在回调里用**父** ctx 注册必抛（真机 harness 实测）；改用子
-  激活的服务能过，但归属记成子激活，我们打开它时被 `scenes.js` 的 `openScene` 拒（「belongs to
-  another activation」）。`apply` 期注册其实合法（LOADING 也放行），但我们仍选惰性注册：命令与
-  卡片本来就在自己的激活上（`ensureScene` / `openScene`）。断言在 `⑨`／`㉜`。
+- **场景在 `apply` 与 `inject` 回调之外注册**：dsh-TUI 的 `tuiScenes.register/open` 只接受已被
+  fiber 插桩记录的激活（`host-access.js` 的 `assertLiveContext` → `trustedFibers`），而 `apply()`
+  期间 fiber 仍在加载、`inject` 回调的 ambient 激活又是子激活 —— 两处调用都会抛
+  「requires a live Cordis activation context」。所以插件**第一次真正打开场景时**（命令 handler
+  或卡片请求）才注册，注册与打开走同一个插件 ctx（`ensureScene` / `openScene`）；只把注册
+  搬进 `inject` 回调、或只把作者换成父 ctx，都仍然打不开。回归断言在 `⑨` 与 `㉜`。
 - 可选的宿主面一律 `ctx.get(name, false)` 软探测，不放进 `inject` 列表。
 - 调试只走 `DSH_TUI_SECRET_DEBUG=1`：`request_credential` 的拒绝 note 附上原因码（不含值）；
   默认措辞不变，不把「人拒绝」与「卡片弹不出来」的差异暴露成可探测的侧信道。

@@ -175,15 +175,18 @@ the host loads and what the npm package ships. `lib/` is generated and is not in
 
 The script covers three layers plus one gate: `①–⑫` the scene (sentinel checks, including a
 real ink render), `⑬–⑮` the quoting of the model's `argv` against a real `/bin/sh`, the tools
-and the permission table (`㉑–㊴`: registration, refusals, scopes, audit, redaction's honest edges, revoke, degradation,
-the card round-trip, the refusal reason codes), and `⑳` the plugin declaration through the host's own
-`@dsh-std/manifest` parser and the TUI profile validator.
+and the permission table (`㉑–㊵`: registration, refusals, scopes, audit, redaction's honest edges,
+revoke, degradation, the card round-trip, the refusal reason codes, and both tool outputs against
+their declared schemas through the host's own validator), and `⑳` the plugin declaration through
+the host's own `@dsh-std/manifest` parser and the TUI profile validator.
 
-**Troubleshooting**: when `/secrets` reports "the secrets scene is not registered", the parenthesis
-carries a short reason code — `registration failed: <code>` (the registration step threw; the same
-line is in the log, with the code/name only, never the raw error text), `open failed: <code>`, or
-`the host did not open it`. When a card always comes back `refused`, start the TUI with
-`DSH_TUI_SECRET_DEBUG=1`: the note on `request_credential` then names the concrete reason
+**Troubleshooting**: the scene is registered on first use, not at startup, because dsh-TUI only
+admits a `tuiScenes` call from an activation it has already recorded (`apply` and an `inject`
+callback both run under a different ambient activation). When `/secrets` reports "the secrets
+scene is not registered", the parenthesis carries a short reason code — `registration failed:
+<code>` (the registration step threw; the same line is in the log, with the code/name only, never
+the raw error text) or `open failed: <code>`. When a card always comes back `refused`, start the
+TUI with `DSH_TUI_SECRET_DEBUG=1`: the note on `request_credential` then names the concrete reason
 (`the host did not open the scene`, `the card was answered with refuse`, `the tool call was aborted`, …).
 A reason never carries a value, and by default a human refusal and a card that cannot be shown stay
 indistinguishable — so the failure reason cannot become a probe.
