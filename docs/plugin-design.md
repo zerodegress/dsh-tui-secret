@@ -150,7 +150,8 @@ waterfall），本插件不写遥测，因此不需要在那里挂脱敏规则�
 ## 验证
 
 `npm test` = `npm run compile` + `scripts/verify.mjs`，两层证据（源代码是 `src/` 里的
-TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编译产物）：
+TypeScript，`lib/` 是 `tsc` 的产物并随仓库提交 —— GitHub 安装不能依赖构建脚本，所以验证跑
+的是编译产物）：
 
 - **场景层**（`①–⑫`）：自写最小 React hook runtime 与 ui kit 替身，把场景真正跑起来，
   按真人按键顺序驱动，记录每一帧渲染字符串、每一条日志、每一次对外调用，再用哨兵值
@@ -159,13 +160,16 @@ TypeScript，`lib/` 是 `tsc` 的产物、不进 git，所以验证跑的是编�
 - **引号与 shell 边界层**（`⑬–⑮`）：把插件拼出来的命令串真的交给 `/bin/sh` 跑 —— 恶意
   `argv`（`;`、`$()`、反引号、引号、换行、空串）必须原样当数据到达；值只在模型**自己写的**
   `["sh","-c","…"]` 里展开，且展开后的输出照样被换成 `[credential]`。
-- **工具与权限层**（`㉑–㊵`）：用假宿主驱动两个工具 —— 运行期注册、未授权即拒绝且不启动命令、
+- **工具与权限层**（`㉑–㊶`）：用假宿主驱动两个工具 —— 运行期注册、未授权即拒绝且不启动命令、
   值只进那一次执行的 `spec.env`（父进程环境逐字节不变）、四个 scope 的入口判定、`once` 用后即撤、
   `until` 到期、`session` 按 session id 且不自动清、审计无值、拒绝/取消零写入、v1 记录兼容、
   `v` / `R` 撤销、没有 shell 面与没有 TUI 前台时的降级、卡片来回（单屏：掩码输入 + ↑/↓ 选 scope → Enter 落库并关屏，
   settle 里不含值）、脱敏的两条诚实边界（编码副本、被上限截断的半值）、短值的代价、
   拒绝 note 的原因码（仅 `DSH_TUI_SECRET_DEBUG=1` 时附上，默认措辞不变、永远不含值），以及
   两个工具的真实返回值用宿主的 schema 校验器过一遍（拒绝与成功两种形状都在声明里）。
+- **安装契约**（`㊶`）：`package.json` 不带 `prepare`/`prepack`/`install`/`postinstall`，
+  `lib/types/` 随仓库提交且不被 `.gitignore` 忽略。GitHub 安装不触发 pnpm 的 `allowBuilds`
+  闸门——它的键带 commit hash，按 URL 让用户加白名单不可行。
 
 调试：`DSH_TUI_SECRET_DEBUG=1 dsh` 让 `request_credential` 的 note 带上具体原因
 （`the host did not open the scene` / `the card was answered with refuse` / `the tool call was aborted` …）。

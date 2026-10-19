@@ -24,10 +24,12 @@ cordis.patch.yml     profile 组合用的包级覆盖层；本包只有一行插
 dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ```
 
-**`src/` 是真源，`lib/types/` 是 `tsc` 的产物**（与上游 dsh-TUI 同一形状）：`lib/` 不进 git
-（见 `.gitignore`），改代码只改 `src/`，改完 `pnpm install`（首次）→ `npm run compile` 重新
-生成；`npm test` 会先编译再验（`pretest`）。手写的 `index.d.ts` 没有了 —— 包的类型面由 `tsc`
-从 `src/index.ts` 生成，`@internal` 的测试入口用 `stripInternal` 剔除。
+**`src/` 是真源，`lib/types/` 是 `tsc` 的产物并随仓库提交**：从 GitHub 装包时 pnpm 默认拒绝
+执行 git 依赖的 `prepare`（`allowBuilds` 的键还带 commit hash，不能指望用户加白名单），所以
+仓库里直接带上编译产物、且 `package.json` 没有任何 install-time 脚本（`㊶` 守住）。改代码只改
+`src/`，改完 `npm run compile` 并把 `lib/types/` 一起提交；`npm test` 仍会先编译（`pretest`），
+提交前确认测试没有留下未提交的产物。手写的 `index.d.ts` 没有了 —— 包的类型面由 `tsc` 从
+`src/index.ts` 生成，`@internal` 的测试入口用 `stripInternal` 剔除。
 
 完整仓库地图、设计依据与实测事实见 [docs/plugin-design.md](docs/plugin-design.md)；
 文档索引见 [docs/README.md](docs/README.md)。
@@ -37,7 +39,7 @@ dsh-plugin.json      插件声明（contracts / contributes / permissions）
 ```sh
 pnpm install    # 首次：装构建依赖（typescript / @types/node / @deepseek-ai/cordis）
 npm run compile # = 清 lib/ 再 tsc -p tsconfig.json：src/ → lib/types/
-npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㊵ 工具与权限表 + ⑳ 声明闸门，35/35 PASS 为通过
+npm test        # 先编译再验：①–⑫ 场景 + ⑬–⑮ 引号/shell + ㉑–㊶ 工具与权限表 + ⑳ 声明闸门，36/36 PASS 为通过
 npm run verify  # 同一入口
 npm run typecheck   # tsc --noEmit，静态关口
 npm pack --dry-run          # 检查发布内容（17 文件；npm 缓存不在工作区时加 npm_config_cache=<目录>）
@@ -49,9 +51,9 @@ dsh plugin --profile dsh-tui add <本仓路径>   # 本地试装（会动 profil
 解析器与 TUI profile 校验器）在缺件时打印 `SKIP`，`SKIP` 不算失败，但**不要**把 `SKIP`
 当通过报出去。
 
-**本仓从 0.2.0 起不再是「零依赖、无构建」**：克隆下来要联网 `pnpm install`，`lib/` 不进 git，
-测试与 `npm pack` 跑的都是编译产物（`package.json` 的 `pretest` / `prepare` 负责编译）。
-运行期依赖仍然为零：`ctx.credentials` / `ctx.tuiScenes` / `ctx.shell` / `ctx.tools` 都是宿主的。
+**本仓从 0.2.0 起不再是「零依赖、无构建」**：克隆下来要联网 `pnpm install`，测试跑的是编译
+产物，仓库里也提交了编译产物（GitHub 安装因此不需要任何构建脚本）。运行期依赖仍然为零：
+`ctx.credentials` / `ctx.tuiScenes` / `ctx.shell` / `ctx.tools` 都是宿主的。
 
 ## 上游边界与契约
 
@@ -82,8 +84,12 @@ dsh plugin --profile dsh-tui add <本仓路径>   # 本地试装（会动 profil
   README 的「已知限制」里，卡片文案也不许暗示「存进去模型就拿不到」。
 - **fail-closed**：任何前提缺失（空值、非法名、保留前缀、被进程环境遮蔽、没有授权、窗口过期、
   场景面缺席、取不到值、shell 面缺失）都拒绝，不猜、不静默降级；**拒绝路径不写任何字节**。
-- **`lib/` 是产物**：源代码只在 `src/`，绝不手改 `lib/types/` 下任何文件；改完跑
-  `npm run compile`（或 `npm test`，它会先编译），提交前确认 `npm run typecheck` 干净。
+- **`lib/` 是产物，但随仓库提交**：源代码只在 `src/`，绝不手改 `lib/types/` 下任何文件；改完跑
+  `npm run compile`（或 `npm test`，它会先编译），把 `lib/types/` 和源码放进**同一个提交**，
+  提交前确认 `npm run typecheck` 干净、测试没有留下未提交的产物。
+- **GitHub 安装必须零构建脚本**：`package.json` 不得有 `prepare` / `prepack` / `install` /
+  `postinstall`；`lib/types/` 必须随仓库提交，`.gitignore` 不得忽略 `lib/`（`㊶` 同时断言这三点）。
+  pnpm 的 `allowBuilds` 键带 commit hash，让用户按 URL 加白名单不可行。
 - **文本语言**：源码注释、用户可见的界面与工具文案、测试标签一律英文（与上游默认一致）；
   `README.md` 英文为底、`README_ZH.md` 中文镜像；`docs/` 中文无后缀、英文用 `.en.md`。
 - **提交信息**：英文 conventional commits，带 scope，例：`docs(style): align all text with the

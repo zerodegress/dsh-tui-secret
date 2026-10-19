@@ -45,8 +45,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run compile",
     "test": "node scripts/verify.mjs",
-    "verify": "node scripts/verify.mjs",
-    "prepare": "npm run compile"
+    "verify": "node scripts/verify.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

@@ -1061,6 +1061,22 @@ await check('㊵ both tool outputs validate against their declared schema', asyn
 })
 
 
+// ---------------------------------------------------------------- the Git-install contract
+// A Git URL is installed too: pnpm refuses to run a Git dependency's install-time scripts
+// unless the consumer allowlists the exact tarball URL, and that URL changes with every
+// commit. The checkout therefore ships the compiled entry and carries no install-time
+// script, so /plugin can install it without touching allowBuilds.
+await check('㊶ a Git install needs no build scripts: lib/ is shipped and nothing runs on install', async () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  for (const name of ['prepare', 'prepack', 'preinstall', 'install', 'postinstall']) {
+    assert(pkg.scripts?.[name] === undefined, `package.json carries a ${name} script; pnpm blocks Git-install builds`)
+  }
+  assert(fs.existsSync(new URL('../lib/types/index.js', import.meta.url)), 'lib/types/index.js is missing from the checkout, so a Git install has no entry')
+  assert(fs.existsSync(new URL('../lib/types/index.d.ts', import.meta.url)), 'lib/types/index.d.ts is missing from the checkout')
+  const ignoreLines = fs.readFileSync(new URL('../.gitignore', import.meta.url), 'utf8').split('\n').map((line) => line.trim())
+  assert(!ignoreLines.includes('lib/'), '.gitignore ignores lib/, so a Git install would not ship the compiled entry')
+})
+
 // ---------------------------------------------------------------- the declaration gate
 // The plugin declaration is consumed twice: the community parser validates its structure
 // (and the host derives the plugin identity from projection.metadata.name), while the TUI

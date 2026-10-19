@@ -52,7 +52,8 @@ dsh plugin --profile dsh-tui add dsh-tui-secret
         echo: dots              # 一个字符一个 •；none 则连长度都不显示
 ```
 
-装完重启 TUI，输入 `/secrets`。
+装完重启 TUI，输入 `/secrets`。直接从 GitHub 地址安装也可以：包里带着编译产物、不跑任何
+install-time 脚本，不涉及 pnpm 的 `allowBuilds`。
 
 ### 两个 agent 工具
 两个工具在**运行期**注册（宿主没有工具类的 manifest 契约）：
@@ -151,11 +152,15 @@ npm test        # = npm run compile && node scripts/verify.mjs
 ```
 
 源码是 `src/` 里的 TypeScript；`tsc` 把它编译进 `lib/types/` —— 宿主加载的是它，
-npm 包发的也是它。`lib/` 是产物、不进 git。
+npm 包发的也是它。`lib/` 是产物，但**随仓库提交**：从 GitHub 装包时 pnpm 默认拒绝执行 git
+依赖的 `prepare`（`allowBuilds` 的键还带 commit hash，不能指望用户加白名单），所以包本身不带
+任何 install-time 脚本（`㊶` 守住）。改完 `src/` 跑 `npm run compile`，把 `lib/types/` 和源码
+放进同一个提交。
 
 脚本覆盖三层加一道闸门：`①–⑫` 场景（哨兵验证，含真 ink 渲染）、`⑬–⑮` 引号与 shell 边界
-（跑真 `/bin/sh`）、`㉑–㊵` 两个工具与权限表（注册、拒绝、四个 scope、审计、脱敏的两条诚实边界、撤销、降级、卡片来回、
-拒绝 note 的原因码、两个工具的返回值用宿主自己的校验器过一遍声明的 schema）、
+（跑真 `/bin/sh`）、`㉑–㊶` 两个工具与权限表（注册、拒绝、四个 scope、审计、脱敏的两条诚实边界、撤销、降级、卡片来回、
+拒绝 note 的原因码、两个工具的返回值用宿主自己的校验器过一遍声明的 schema、Git 安装契约：
+没有 install-time 脚本且编译产物随仓库提交）、
 `⑳` 插件声明 —— 用宿主自己的 `@dsh-std/manifest` 解析器与 TUI profile 校验器离线跑一遍，
 manifest 一漂当场就红。
 
