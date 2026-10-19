@@ -41,11 +41,19 @@
 Supported target: **`@deepseek-harness-tui/dsh-tui`** 0.16.x — other TUI implementations
 are out of scope.
 
+From the shell:
+
 ```sh
-dsh plugin --profile dsh-tui add dsh-tui-secret
+dsh plugin --profile dsh-tui add github:zerodegress/dsh-tui-secret
 ```
 
-Or add one row to the profile's `cordis.patch.yml` (this package's own
+Or from inside the TUI:
+
+```
+/plugin install https://github.com/zerodegress/dsh-tui-secret
+```
+
+You can also add one row to the profile's `cordis.patch.yml` (this package's own
 `cordis.patch.yml` is exactly that row, applied by the bundle mechanism on install):
 
 ```yaml
@@ -57,9 +65,7 @@ Or add one row to the profile's `cordis.patch.yml` (this package's own
         echo: dots              # one • per character; 'none' hides even the length
 ```
 
-Restart the TUI and type `/secrets`. Installing straight from the GitHub URL works too: the
-package ships its compiled entry and runs no install script, so pnpm's `allowBuilds` is not
-involved.
+Restart the TUI and type `/secrets`.
 
 ### Agent tools
 Two tools are registered at runtime (the host has no manifest contract for tools):
@@ -174,19 +180,15 @@ pnpm install    # first run: typescript / @types/node / @deepseek-ai/cordis (bui
 npm test        # = npm run compile && node scripts/verify.mjs
 ```
 
-The source is TypeScript in `src/`; `tsc` compiles it into `lib/types/`, which is what the host
-loads and what the npm package ships. `lib/` is committed on purpose: a GitHub install would
-otherwise need pnpm to run `prepare`, and pnpm only allows that when the consumer allowlists the
-exact tarball URL (which changes with every commit). The package therefore runs no install-time
-script at all (`㊶` guards this). After editing `src/`, run `npm run compile` and commit the
-`lib/types/` output in the same commit.
+The source is TypeScript in `src/`; `tsc` compiles it into `lib/types/`, which is committed and
+is what the host loads. After editing `src/`, run `npm run compile` and commit the `lib/types/`
+output in the same commit.
 
 The script covers three layers plus one gate: `①–⑫` the scene (sentinel checks, including a
 real ink render), `⑬–⑮` the quoting of the model's `argv` against a real `/bin/sh`, the tools
 and the permission table (`㉑–㊶`: registration, refusals, scopes, audit, redaction's honest edges,
-revoke, degradation, the card round-trip, the refusal reason codes, both tool outputs against
-their declared schemas through the host's own validator, and the Git-install contract: no
-install-time scripts plus the compiled entry shipped), and `⑳` the plugin declaration through
+revoke, degradation, the card round-trip, the refusal reason codes, and both tool outputs against
+their declared schemas through the host's own validator), and `⑳` the plugin declaration through
 the host's own `@dsh-std/manifest` parser and the TUI profile validator.
 
 **Troubleshooting**: the scene is registered on first use, not at startup, because dsh-TUI only

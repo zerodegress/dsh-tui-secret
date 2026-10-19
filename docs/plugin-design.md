@@ -191,7 +191,7 @@ TypeScript，`lib/` 是 `tsc` 的产物并随仓库提交 —— GitHub 安装�
 
 - 只支持 `@deepseek-harness-tui/dsh-tui` 0.16.x；其他 TUI 实现不在目标内。
 - Node `^22.19 || >=24`；ESM；无运行时依赖；构建依赖只有 `typescript` / `@types/node` /
-  `@deepseek-ai/cordis`（首次要联网 `pnpm install`，`lib/` 不入库）。
+  `@deepseek-ai/cordis`（仅构建用；`lib/types/` 随仓库提交）。
 - 接缝缺席时静默降级：场景面不在就什么都不注册，绝不拖垮 TUI 启动；工具面不在就两个工具都不注册。
 - **局限（如实写）**：凭据库是明文 YAML、沙箱只限写 → 有 `bash` 的 agent 能直接读；脱敏只覆盖
   那一次执行的返回片段（编码或截断后的副本认不出，断言 `㊱`/`㊲` 钉住这一点）；闸门只对 agent
