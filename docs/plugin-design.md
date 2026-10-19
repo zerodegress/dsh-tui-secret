@@ -39,15 +39,17 @@ TUI 贡献协议的设置区块字段类型只有 `text | number | boolean | sel
 （剔除 `DEEPSEEK_*` / `DSH_*`）在 0.16.0 已经存在，但设置屏尚未把该字段渲染成掩码。
 所以「屏幕上不出现明文」这件事，v1 只能由自己渲染的**全屏场景**保证。
 
-**场景的注册与打开必须来自同一个激活。**
-dsh-TUI 按**注册时的激活**记录每个场景（`lib/types/dsh-adapter/scenes.js:102`
-`state.owners.set(id, activationOwner)`），`openScene` 在 `:174-177` 比对这个归属：不是
-同一个激活就 `warn("scene ... belongs to another activation")` 并返回 `false`。而 Cordis 的
-`ctx.inject(deps, cb)` 就是 `plugin({ inject, apply: cb })`（`@deepseek-ai/cordis` 的
-`Context.inject`），**会起一个子激活**。所以注册若发生在 inject 回调里、而命令与卡片从
-插件自己的 ctx 调 `open()`，两者激活不同，`/secrets` 必然打不开（现场表现就是
-「the secrets scene is not registered (the plugin may be disabled)」）。本插件的做法：
-inject 只用来等 `tuiScenes` 挂载，注册与打开**都走插件自己的 ctx**（回归断言见 `⑨`）。
+**场景在首次使用时注册，不在 `inject` 回调里碰宿主面（实测）。**
+宿主只接受「**当前正在执行的那个激活**」发出的 service 调用：`host-access.js` 的 `runActivation`
+把激活令牌挂到执行环境上，`assertLiveContext` 见到不属于被调 ctx 的令牌就按 stale activation 拒
+（对 `requirePluginCaller` 报 `requires a live Cordis activation context`）。`ctx.inject(deps, cb)`
+的回调跑在它新建的**子激活**下，因此：回调里用**父** ctx 调 ⇒ 抛（拿真宿主与线上同一 cordis
+实测）；用**子**激活的服务调 ⇒ 过，但归属记成子激活（`scenes.js:102`
+`state.owners.set(id, activationOwner)`），之后 `openScene` 在 `:174-177` 比对归属不等 ⇒ `false`
+（「belongs to another activation」）。`apply` 期注册本身是合法的（`assertLiveContext` 放行
+LOADING=1 与 ACTIVE=2，实测也过），本插件仍选**惰性注册**：命令与卡片本来就在自己的激活上，
+顺手在那里 `register` 一次再 `open`，并把注册/打开的失败原因（短码）打进日志与 `/secrets`
+文案 —— 最早那次静默失败正是「not registered」查不下去的原因。
 
 **凭据值不会自动进入模型 shell。**
 `ctx.credentials` 的消费者是「按 ref 取值的插件」（LLM key 那类）。核心不会把凭据值

@@ -157,8 +157,8 @@ npm 包发的也是它。`lib/` 是产物、不进 git。
 manifest 一漂当场就红。
 
 **排障**：`/secrets` 报「the secrets scene is not registered」时，括号里带短原因码 ——
-`registration failed: <code>`（注册那一步抛了，日志里也有同一句，只记 code/name 不记原始文本）
-或 `the host does not have it in the scene registry`。卡片总是 `refused` 时，用
+`registration failed: <code>`（注册那一步抛了，日志里也有同一句，只记 code/name 不记原始文本）、
+`open failed: <code>`，或 `the host did not open it`。卡片总是 `refused` 时，用
 `DSH_TUI_SECRET_DEBUG=1` 起 TUI —— `request_credential` 的 note 会附上具体原因
 （`the host did not open the scene`、`the card was answered with refuse`、`the tool call was aborted`…），
 里面永远没有值。默认不区分「人拒绝」与「卡片弹不出来」，以免失败原因变成可探测的侧信道。
