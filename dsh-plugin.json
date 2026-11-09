@@ -2,7 +2,7 @@
   "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
   "id": "com.zerodegress.dsh-tui-secret",
   "name": "dsh-tui-secret",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "manifestVersion": "0.15",
   "x-description": "Secure secret entry for DeepSeek Harness TUI. A /secrets scene renders its own masked input (one bullet per keystroke, never the value or its length) and writes through the dsh credentials seam; it never registers a shell-env contributor, never logs a value, and never writes the credential document itself.",
   "facets": {
